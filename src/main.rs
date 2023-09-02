@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -16,6 +16,7 @@ use pnet::packet::{
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::task::JoinSet;
+use tokio::time::timeout;
 
 const ICMP_REQUEST_PACKET_SIZE: usize = MutableEchoRequestPacket::minimum_packet_size();
 const ICMP_REPLY_PACKET_SIZE: usize =
@@ -76,11 +77,13 @@ async fn send(q: Arc<ArrayQueue<IcmpSocket>>, seq: u16) {
 #[derive(Debug)]
 struct IcmpSocket {
     inner: Socket,
+    icmp_timeout: Duration,
+    addr: SockAddr,
     buf: [u8; ICMP_REQUEST_PACKET_SIZE],
 }
 
 impl IcmpSocket {
-    fn new(addr: SockAddr) -> Result<Self> {
+    fn new(addr: SockAddr, icmp_timeout: Duration) -> Result<Self> {
         let inner = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
 
         inner.set_nonblocking(true)?;
@@ -98,7 +101,12 @@ impl IcmpSocket {
             icmp_packet.set_identifier(42);
         }
 
-        Ok(Self { inner, buf })
+        Ok(Self {
+            inner,
+            buf,
+            addr,
+            icmp_timeout,
+        })
     }
 
     /// Updates the icmp buffer with the current icmp sequence and the new icmp checksum.
@@ -113,6 +121,28 @@ impl IcmpSocket {
     }
 
     async fn ping(&mut self, seq: u16) {
+        let start = Instant::now();
+        let icmp_timeout = self.icmp_timeout.clone();
+        let ping_actual = self.ping_actual(seq);
+        match timeout(icmp_timeout, ping_actual).await {
+            Err(_elapsed) => println!(
+                "{},{},TIMEDOUT",
+                self.addr.as_socket_ipv4().unwrap().ip(),
+                seq
+            ),
+            Ok(_) => {
+                let elapsed = start.elapsed();
+                println!(
+                    "{},{},{}",
+                    self.addr.as_socket_ipv4().unwrap().ip(),
+                    seq,
+                    elapsed.as_millis()
+                );
+            }
+        }
+    }
+
+    async fn ping_actual(&mut self, seq: u16) {
         self.update_icmp_request_packet(seq);
 
         loop {
@@ -271,7 +301,7 @@ async fn main() -> Result<()> {
     let queue_size = 100usize;
     let queue: ArrayQueue<IcmpSocket> = ArrayQueue::new(queue_size);
     for _ in 0..queue_size {
-        let icmp_socket = IcmpSocket::new(addr.clone())?;
+        let icmp_socket = IcmpSocket::new(addr.clone(), icmp_timeout.clone())?;
         queue
             .push(icmp_socket)
             .expect("don't push more than the queues capacity");
