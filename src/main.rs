@@ -147,7 +147,7 @@ impl IcmpSocket {
         let max_packet_size = ICMP_REPLY_PACKET_SIZE + 100;
         loop {
             let mut reply_slice =
-                [std::mem::MaybeUninit::<u8>::zeroed(); ICMP_REPLY_PACKET_SIZE + 100];
+                [std::mem::MaybeUninit::<u8>::uninit(); ICMP_REPLY_PACKET_SIZE + 100];
             match self.inner.recv(&mut reply_slice) {
                 Err(e) => {
                     if e.kind() == ErrorKind::WouldBlock {
@@ -183,6 +183,23 @@ impl IcmpSocket {
     }
 }
 
+/// Transmute an owned array of `MaybeUninit<u8>` into `Vec<u8>`, check that it's the right kind of
+/// IP/ICMP packet, then give ownership of the `Vec<u8>` over to a `EchoReplyPacket<'static>` if
+/// everything goes well.
+///
+/// Note that while dropping `MaybeUninit` values doesn't drop the contained value [1], in this
+/// case we rely on the fact that only up to `bytes_read` elements have been written to by the
+/// socket library, all other elements are actually uninitialized and therefore safe to be dropped
+/// in this function. The elements up to `bytes_read` are properly converted into `u8` and
+/// therefore will be properly dropped either by this method or by the calling context once it
+/// takes ownership of the `EchoReplyPacket<'static>` return value.
+///
+/// There is however, a small risk of memory leak IF the program panics while iterating over the
+/// initialized values of `buf` [2]. But if the program does panic, it's not like we're recovering
+/// it anywhere so the entire program should terminate and memory returned to the kernel.
+///
+/// [1] https://doc.rust-lang.org/stable/std/mem/union.MaybeUninit.html#method.new
+/// [2] https://doc.rust-lang.org/stable/std/mem/union.MaybeUninit.html#initializing-an-array-element-by-element
 fn get_icmp_echo_reply_packet(
     buf: [std::mem::MaybeUninit<u8>; ICMP_REPLY_PACKET_SIZE + 100],
     bytes_read: usize,
