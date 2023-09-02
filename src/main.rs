@@ -23,7 +23,7 @@ const ICMP_REPLY_PACKET_SIZE: usize =
 
 async fn send(q: Arc<ArrayQueue<IcmpSocket>>, seq: u16) {
     let mut socket = loop {
-        //println!("trying queue for packet {}", seq);
+        log::trace!("try retrieving socket for packet {}", seq);
         match q.pop() {
             Some(b) => break b,
             None => {
@@ -35,7 +35,7 @@ async fn send(q: Arc<ArrayQueue<IcmpSocket>>, seq: u16) {
     socket.ping(seq).await;
 
     loop {
-        //println!("pushing packet buffer back onto queue");
+        log::trace!("try pushing socket back onto queue");
         match q.push(socket) {
             Ok(_) => break,
             Err(b) => {
@@ -125,7 +125,7 @@ impl IcmpSocket {
                     }
                 }
                 Ok(length) => {
-                    println!("sent {} bytes for request {}", length, seq);
+                    log::debug!("sent {} bytes for request {}", length, seq);
                     break;
                 }
             }
@@ -146,8 +146,7 @@ impl IcmpSocket {
         // that's happening
         let max_packet_size = ICMP_REPLY_PACKET_SIZE + 100;
         loop {
-            let mut reply_slice =
-                [std::mem::MaybeUninit::<u8>::uninit(); ICMP_REPLY_PACKET_SIZE + 100];
+            let mut reply_slice = [MaybeUninit::<u8>::uninit(); ICMP_REPLY_PACKET_SIZE + 100];
             match self.inner.recv(&mut reply_slice) {
                 Err(e) => {
                     if e.kind() == ErrorKind::WouldBlock {
@@ -169,7 +168,7 @@ impl IcmpSocket {
                     );
                 }
                 Ok(bytes_read) => {
-                    println!("received {} bytes for reply {}", bytes_read, seq);
+                    log::debug!("received {} bytes for reply {}", bytes_read, seq);
                     if let Some(icmp_reply_packet) =
                         get_icmp_echo_reply_packet(reply_slice, bytes_read)
                     {
@@ -201,7 +200,7 @@ impl IcmpSocket {
 /// [1] https://doc.rust-lang.org/stable/std/mem/union.MaybeUninit.html#method.new
 /// [2] https://doc.rust-lang.org/stable/std/mem/union.MaybeUninit.html#initializing-an-array-element-by-element
 fn get_icmp_echo_reply_packet(
-    buf: [std::mem::MaybeUninit<u8>; ICMP_REPLY_PACKET_SIZE + 100],
+    buf: [MaybeUninit<u8>; ICMP_REPLY_PACKET_SIZE + 100],
     bytes_read: usize,
 ) -> Option<EchoReplyPacket<'static>> {
     let mut reply_buf: Vec<u8> = buf
@@ -230,14 +229,14 @@ fn get_icmp_echo_reply_packet(
                 }
             }
         }
-        println!("ipv4 header len: {}", ipv4_packet.get_header_length());
-        println!("ipv4 total len: {}", ipv4_packet.get_total_length());
+        log::trace!("ipv4 header len: {}", ipv4_packet.get_header_length());
+        log::trace!("ipv4 total len: {}", ipv4_packet.get_total_length());
         ipv4_packet.get_total_length() as usize - ipv4_packet.payload().len() as usize
     };
 
-    println!("ipv4 header len: {}", ipv4_header_len);
+    log::trace!("ipv4 header len: {}", ipv4_header_len);
     let reply_buf: Vec<u8> = reply_buf.drain(ipv4_header_len..).collect();
-    println!("echo reply buf len: {}", reply_buf.len());
+    log::trace!("echo reply buf len: {}", reply_buf.len());
     Some(EchoReplyPacket::owned(reply_buf).expect("meow"))
 }
 
