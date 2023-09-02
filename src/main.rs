@@ -144,7 +144,11 @@ impl IcmpSocket {
 
     async fn ping_actual(&mut self, seq: u16) {
         self.update_icmp_request_packet(seq);
+        self.send_echo_request(seq).await;
+        self.recv_echo_reply(seq).await;
+    }
 
+    async fn send_echo_request(&mut self, seq: u16) {
         loop {
             match self.inner.send(&self.buf) {
                 Err(e) => {
@@ -161,6 +165,9 @@ impl IcmpSocket {
             }
         }
 
+    }
+
+    async fn recv_echo_reply(&mut self, seq: u16) {
         // "works", but nothing gets written
         //let mut reply_buf: Vec<MaybeUninit<u8>> = Vec::new();
         //let mut reply_slice = reply_buf.as_mut_slice();
