@@ -22,7 +22,7 @@ const ICMP_REQUEST_PACKET_SIZE: usize = MutableEchoRequestPacket::minimum_packet
 const ICMP_REPLY_PACKET_SIZE: usize =
     Ipv4Packet::minimum_packet_size() + EchoReplyPacket::minimum_packet_size();
 
-async fn send(q: Arc<ArrayQueue<IcmpSocket>>, seq: u16) {
+async fn ping(q: Arc<ArrayQueue<IcmpSocket>>, seq: u16) {
     let mut socket = loop {
         log::trace!("try retrieving socket for packet {}", seq);
         match q.pop() {
@@ -54,7 +54,7 @@ async fn send(q: Arc<ArrayQueue<IcmpSocket>>, seq: u16) {
 /// So I tried using Domain::PACKET, but both `bind` and `send` socket methods were
 /// failing with EINVAL errors, which suggests to me that the `socket2` crate may not be
 /// handling those calls correctly for Domain::PACKET sockets (or I just haven't figured out
-/// what else I needed to do to make it work).
+/// what else I needed to do to make it work beyond manually constructing an ipv4 buffer).
 ///
 /// The reason I wanted to use Domain::PACKET is that I have been reading the `zmap` paper
 /// recently[1] and learned one of the tricks they use to achieve such high packet throughput
@@ -70,8 +70,8 @@ async fn send(q: Arc<ArrayQueue<IcmpSocket>>, seq: u16) {
 /// each send call, after which they can re-used for subsequent requests.
 ///
 /// To be honest, for a simple exercise like this the memory allocation optimization probably isn't
-/// necessary, but I've been wondering how I would implement this in Rust while reading the zmap
-/// paper and this interview is a good chance to do that.
+/// necessary, but I've been wondering how I would implement something zmap-like in Rust while
+/// reading the original zmap paper and this interview is a good chance to do that.
 ///
 /// [1] https://zmap.io/paper.pdf
 #[derive(Debug)]
@@ -289,17 +289,18 @@ async fn main() -> Result<()> {
     // Rather than using a single socket shared across all packets, we want separate sockets to
     // simplify implementation of echo reply timeout on each echo request-reply pair. The idea
     // here being that in the course of each `ping` call each socket only accepts the reply packet
-    // corresponding to the request it just sent and performs a tokio waits between `recv` so that
-    // an outer tokio timeout future can cancel the inner future at the specified icmp timeout.
+    // corresponding to the request it just sent and performs a tokio sleeps between non-blocking
+    // `recv` attempts so that an outer tokio timeout future can cancel the inner future at the
+    // specified icmp timeout.
     //
     // One potential limitation here is going to be the number of concurrent pings that can run
-    // since the number of `IcmpSocket` instances is limited. One possibility to address this would
-    // be to use crossbeam's `SegQueue`[1] type which is an unbounded data structure with similar
-    // semantics. In this case we wouldn't even need to initialize the queue here, we could create
-    // new `IcmpSocket`s whenever `SeqQueue.pop` returns None, then push the new socket onto the
-    // queue when its first usage is finished. This would allow the queue to grow to its natural
-    // size for a given set of input parameters (count, interval) and network characteristics
-    // (round trip latency).
+    // since the number of `IcmpSocket` instances is limited using the ArrayQueue. One possibility
+    // to address this would be to use crossbeam's `SegQueue`[1] type which is an unbounded data
+    // structure with similar semantics. In this case we wouldn't even need to initialize the queue
+    // here, we could create new `IcmpSocket`s whenever `SeqQueue.pop` returns None, then push the
+    // new socket onto the queue when its first usage is finished. This would allow the queue to
+    // grow to its natural size for a given set of input parameters (count, interval) and network
+    // characteristics (round trip latency).
     //
     // I'm going to stick with ArrayQueue for now because I don't think it's necessary to really
     // perfect the concurrency characteristics here, it's just something I wanted to point out.
@@ -322,7 +323,7 @@ async fn main() -> Result<()> {
     for i in 0..count {
         interval.tick().await;
         let q = queue.clone();
-        set.spawn(async move { send(q, i).await });
+        set.spawn(async move { ping(q, i).await });
     }
 
     while set.join_next().await.is_some() {}
