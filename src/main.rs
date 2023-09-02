@@ -1,5 +1,6 @@
 use crossbeam::queue::ArrayQueue;
 use std::io::ErrorKind;
+use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,25 +8,21 @@ use std::time::Duration;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 use pnet::packet::{
-    icmp::{
-        echo_reply::EchoReplyPacket, echo_request::EchoRequestPacket,
-        echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket, IcmpTypes,
-    },
+    icmp::echo_reply::EchoReplyPacket,
+    icmp::{echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket, IcmpTypes},
+    ip::IpNextHeaderProtocols,
     ipv4::Ipv4Packet,
-    ipv4::MutableIpv4Packet,
-    MutablePacket, Packet, PacketSize,
+    Packet,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::task::JoinSet;
 
-const MIN_ICMP_PACKET_SIZE: usize = MutableEchoRequestPacket::minimum_packet_size();
-const IPV4_HEADER_LENGTH: usize = MutableIpv4Packet::minimum_packet_size();
-const IPV4_PACKET_LENGTH: usize = MIN_ICMP_PACKET_SIZE + IPV4_HEADER_LENGTH;
+const ICMP_REQUEST_PACKET_SIZE: usize = MutableEchoRequestPacket::minimum_packet_size();
+const ICMP_REPLY_PACKET_SIZE: usize =
+    Ipv4Packet::minimum_packet_size() + EchoReplyPacket::minimum_packet_size();
 
-type Ipv4Buf = [u8; IPV4_PACKET_LENGTH];
-
-async fn send(s: Arc<Socket>, q: Arc<ArrayQueue<Ipv4Buf>>, seq: u16) -> usize {
-    let mut ipv4_buf = loop {
+async fn send(q: Arc<ArrayQueue<IcmpSocket>>, seq: u16) {
+    let mut socket = loop {
         //println!("trying queue for packet {}", seq);
         match q.pop() {
             Some(b) => break b,
@@ -35,134 +32,78 @@ async fn send(s: Arc<Socket>, q: Arc<ArrayQueue<Ipv4Buf>>, seq: u16) -> usize {
         }
     };
 
-    update_icmp_request_packet(&mut ipv4_buf, seq);
+    socket.ping(seq).await;
 
-    let bytes_sent = loop {
-        //println!("looping");
-        match s.send(&ipv4_buf) {
-            Err(e) => {
-                if e.kind() == ErrorKind::WouldBlock {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                } else {
-                    panic!("unhandled socket send error: {}", e);
-                }
-            }
-            Ok(length) => {
-                println!("sent {} bytes for packet {}", length, seq);
-                break length;
-            }
-        }
-    };
     loop {
         //println!("pushing packet buffer back onto queue");
-        match q.push(ipv4_buf) {
+        match q.push(socket) {
             Ok(_) => break,
             Err(b) => {
                 tokio::time::sleep(Duration::from_millis(1)).await;
-                ipv4_buf = b;
+                socket = b;
             }
         }
     }
-
-    return bytes_sent;
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let count: u16 = 5;
-    let interval: u64 = 500;
-    let timeout: Option<Duration> = Some(Duration::from_millis(5000));
+/// Abstraction for containing individual socket instances and pre-allocated ICMP buffer.
+///
+/// # Notes on Socket choice:
+///
+/// So I tried using Domain::PACKET, but both `bind` and `send` socket methods were
+/// failing with EINVAL errors, which suggests to me that the `socket2` crate may not be
+/// handling those calls correctly for Domain::PACKET sockets (or I just haven't figured out
+/// what else I needed to do to make it work).
+///
+/// The reason I wanted to use Domain::PACKET is that I have been reading the `zmap` paper
+/// recently[1] and learned one of the tricks they use to achieve such high packet throughput
+/// is to use AF_PACKET and manually construct Ethernet packets. This has two primary benefits:
+///
+/// First, it bypasses TCP/IP/whatever handling at the kernel level. This reduces kernel-specific
+/// cpu and memory overhead in high throughput applications.
+///
+/// Second, in network mapping (or ICMP echo as is the case here) there are often very few
+/// differences between the different request packets, which means one can optimize the
+/// program to reduce memory allocations by pre-allocating request packet buffers rather
+/// constructing them for every request. Request packet buffers are only needed for the duration of
+/// each send call, after which they can re-used for subsequent requests.
+///
+/// To be honest, for a simple exercise like this the memory allocation optimization probably isn't
+/// necessary, but I've been wondering how I would implement this in Rust while reading the zmap
+/// paper and this interview is a good chance to do that.
+///
+/// [1] https://zmap.io/paper.pdf
+#[derive(Debug)]
+struct IcmpSocket {
+    inner: Socket,
+    buf: [u8; ICMP_REQUEST_PACKET_SIZE],
+}
 
-    let ipv4_addr: Ipv4Addr = "1.1.1.1".parse().expect("should work, right?");
-    let addr: SockAddr = SocketAddrV4::new(ipv4_addr, 0).into();
-    let socket = Arc::new(Socket::new(
-        Domain::IPV4,
-        Type::RAW,
-        Some(Protocol::ICMPV4),
-    )?);
-    socket.set_nonblocking(true)?;
-    socket.set_write_timeout(timeout)?;
-    socket.set_read_timeout(timeout)?;
-    socket.connect(&addr)?;
-    //println!("connected");
+impl IcmpSocket {
+    fn new(addr: SockAddr) -> Result<Self> {
+        let inner = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
 
-    let mut interval = tokio::time::interval(Duration::from_millis(interval));
+        inner.set_nonblocking(true)?;
+        let rw_timeout = Some(Duration::from_millis(100));
+        inner.set_write_timeout(rw_timeout)?;
+        inner.set_read_timeout(rw_timeout)?;
+        inner.connect(&addr)?;
 
-    let mut set = JoinSet::new();
-
-    // preallocate Ipv4 packets so we can avoid allocating memory on every asynchronous send.
-    let queue: ArrayQueue<Ipv4Buf> = ArrayQueue::new(10);
-    for _ in 0..9 {
-        let mut ipv4_buf = [0u8; IPV4_PACKET_LENGTH];
-        // println!("min icmp packet size: {}", MIN_ICMP_PACKET_SIZE);
-        // println!("ipv4 header length: {}", IPV4_HEADER_LENGTH);
-        // println!("ipv4 packet size: {}", ipv4_buf.len());
+        let mut buf = [0u8; ICMP_REQUEST_PACKET_SIZE];
         {
-            // as long as we're pre-allocating ipv4 packets, we may as wellwalso pre-populate ipv4
-            // and icmp fields that will be common among all packets
-            let mut ipv4_packet = MutableIpv4Packet::new(&mut ipv4_buf)
-                .expect("the buf size is set to the minimum packet size");
-            ipv4_packet.set_destination(ipv4_addr);
-            ipv4_packet.set_header_length(IPV4_HEADER_LENGTH as u8);
-
-            // if we don't set the total length here, then setting the payload will fail due to
-            // jankiness in the set_payload function generated by pnet's packet macro that looks at
-            // the declared packet length.
-            //
-            // this makes me think that it's probably not such a great idea to use socket2 as
-            // suggested in the exercise but to instead use pnet's own transport channels, which
-            // look like they do a good job of abstracting over IPV4 details
-            ipv4_packet.set_total_length(IPV4_PACKET_LENGTH.try_into().expect(""));
-
-            let mut icmp_buf = [0u8; MIN_ICMP_PACKET_SIZE];
-            //println!("icmp buf size: {}", icmp_buf.len());
-            {
-                let mut icmp_packet = MutableEchoRequestPacket::new(&mut icmp_buf)
-                    .expect("the buf size should be exactly the minimum icmp packet size");
-                icmp_packet.set_icmp_type(IcmpTypes::EchoRequest);
-                icmp_packet.set_icmp_code(IcmpCode(0));
-                icmp_packet.set_identifier(42);
-                //println!("icmp_packet size: {}", icmp_packet.packet_size());
-            }
-            //println!("ipv4 header length: {}", ipv4_packet.get_header_length());
-            //println!(
-            //    "ipv4 packet size (without payload): {}",
-            //    ipv4_packet.packet_size()
-            //);
-            ipv4_packet.set_payload(&icmp_buf);
+            let mut icmp_packet = MutableEchoRequestPacket::new(&mut buf)
+                .expect("the buf size should be exactly the minimum icmp packet size");
+            icmp_packet.set_icmp_type(IcmpTypes::EchoRequest);
+            icmp_packet.set_icmp_code(IcmpCode(0));
+            icmp_packet.set_identifier(42);
         }
-        queue
-            .push(ipv4_buf)
-            .expect("don't push more than the queues capacity");
+
+        Ok(Self { inner, buf })
     }
 
-    let queue = Arc::new(queue);
-    //println!("queue configured");
-
-    for i in 0..count {
-        println!("sending packet {}", i);
-        interval.tick().await;
-        let s = socket.clone();
-        let q = queue.clone();
-        // send asynchronously
-        set.spawn(async move { send(s, q, i).await });
-        // receive responses asynchronously
-    }
-
-    while set.join_next().await.is_some() {}
-
-    Ok(())
-}
-
-/// Updates the given ipv4 buffer with the current icmp sequence, the new icmp checksum, and the
-/// new ipv4 checksum.
-fn update_icmp_request_packet(ipv4_buf: &mut [u8; IPV4_PACKET_LENGTH], seq: u16) {
-    {
-        let mut ipv4_packet = MutableIpv4Packet::new(ipv4_buf)
-            .expect("the buf size is set to the minimum packet size");
-
-        let mut icmp_buf = ipv4_packet.payload_mut();
-        let mut icmp_packet = MutableEchoRequestPacket::new(&mut icmp_buf)
+    /// Updates the icmp buffer with the current icmp sequence and the new icmp checksum.
+    fn update_icmp_request_packet(&mut self, seq: u16) {
+        let mut icmp_packet = MutableEchoRequestPacket::new(&mut self.buf)
             .expect("the buf size should be exactly the minimum icmp packet size");
         icmp_packet.set_sequence_number(seq);
 
@@ -171,9 +112,167 @@ fn update_icmp_request_packet(ipv4_buf: &mut [u8; IPV4_PACKET_LENGTH], seq: u16)
         icmp_packet.set_checksum(checksum);
     }
 
-    let checksum = { pnet::packet::ipv4::checksum(&Ipv4Packet::new(ipv4_buf).expect("TODO")) };
+    async fn ping(&mut self, seq: u16) {
+        self.update_icmp_request_packet(seq);
 
-    let mut ipv4_packet =
-        MutableIpv4Packet::new(ipv4_buf).expect("the buf size is set to the minimum packet size");
-    ipv4_packet.set_checksum(checksum)
+        loop {
+            match self.inner.send(&self.buf) {
+                Err(e) => {
+                    if e.kind() == ErrorKind::WouldBlock {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    } else {
+                        panic!("unhandled socket send error: {}", e);
+                    }
+                }
+                Ok(length) => {
+                    println!("sent {} bytes for request {}", length, seq);
+                    break;
+                }
+            }
+        }
+
+        // "works", but nothing gets written
+        //let mut reply_buf: Vec<MaybeUninit<u8>> = Vec::new();
+        //let mut reply_slice = reply_buf.as_mut_slice();
+
+        // doesn't work because recv can (apparently) only take an array of MaybeUninit<u8> values
+        //let mut reply_buf = vec![0u8; ICMP_REPLY_PACKET_SIZE];
+        //let mut reply_slice = reply_buf.as_mut_slice();
+
+        // works, bytes get written, but requires unsafe mem::transmute to get something usable
+
+        // note: we create a bigger array than ICMP_REPLY_PACKET_SIZE because it's possible we get
+        // something other than an ICMP reply from the remote and we should try to be aware when
+        // that's happening
+        let max_packet_size = ICMP_REPLY_PACKET_SIZE + 100;
+        loop {
+            let mut reply_slice =
+                [std::mem::MaybeUninit::<u8>::zeroed(); ICMP_REPLY_PACKET_SIZE + 100];
+            match self.inner.recv(&mut reply_slice) {
+                Err(e) => {
+                    if e.kind() == ErrorKind::WouldBlock {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    } else {
+                        panic!("unhandled socket send error: {}", e);
+                    }
+                }
+                Ok(bytes_read) if bytes_read < ICMP_REPLY_PACKET_SIZE => {
+                    panic!(
+                        "received packet too small {}, expected {}",
+                        bytes_read, ICMP_REPLY_PACKET_SIZE,
+                    );
+                }
+                Ok(bytes_read) if bytes_read > max_packet_size => {
+                    panic!(
+                        "exceeded max packet size {}, received {}",
+                        max_packet_size, bytes_read,
+                    );
+                }
+                Ok(bytes_read) => {
+                    println!("received {} bytes for reply {}", bytes_read, seq);
+                    if let Some(icmp_reply_packet) =
+                        get_icmp_echo_reply_packet(reply_slice, bytes_read)
+                    {
+                        if icmp_reply_packet.get_sequence_number() == seq {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn get_icmp_echo_reply_packet(
+    buf: [std::mem::MaybeUninit<u8>; ICMP_REPLY_PACKET_SIZE + 100],
+    bytes_read: usize,
+) -> Option<EchoReplyPacket<'static>> {
+    let mut reply_buf: Vec<u8> = buf
+        .into_iter()
+        .take(bytes_read)
+        .map(|m| unsafe { std::mem::transmute::<_, u8>(m) })
+        .collect();
+
+    // check that it's an ICMP packet, comlain if it isn't
+    let ipv4_header_len = {
+        let ipv4_packet = Ipv4Packet::new(&reply_buf)
+            .expect("packet length already verified to be ICMP_REPLY_PACKET_SIZE");
+        let protocol = ipv4_packet.get_next_level_protocol();
+        match protocol {
+            IpNextHeaderProtocols::Icmp => (),
+            _ => {
+                panic!("unexpected ip next level protocol number: {}", protocol);
+            }
+        }
+        {
+            let icmp_packet = IcmpPacket::new(ipv4_packet.payload()).expect("meow");
+            match (icmp_packet.get_icmp_type(), icmp_packet.get_icmp_code()) {
+                (IcmpTypes::EchoReply, IcmpCode(0)) => (),
+                (t, c) => {
+                    panic!("unexpected icmp (type, code): ({:?}, {:?})", t, c);
+                }
+            }
+        }
+        println!("ipv4 header len: {}", ipv4_packet.get_header_length());
+        println!("ipv4 total len: {}", ipv4_packet.get_total_length());
+        ipv4_packet.get_total_length() as usize - ipv4_packet.payload().len() as usize
+    };
+
+    println!("ipv4 header len: {}", ipv4_header_len);
+    let reply_buf: Vec<u8> = reply_buf.drain(ipv4_header_len..).collect();
+    println!("echo reply buf len: {}", reply_buf.len());
+    Some(EchoReplyPacket::owned(reply_buf).expect("meow"))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let count: u16 = 5;
+    let interval: u64 = 500;
+    let icmp_timeout = Duration::from_millis(5000);
+
+    let ipv4_addr: Ipv4Addr = "1.1.1.1".parse().expect("should work, right?");
+    let addr: SockAddr = SocketAddrV4::new(ipv4_addr, 0).into();
+
+    // Rather than using a single socket shared across all packets, we want separate sockets to
+    // simplify implementation of echo reply timeout on each echo request-reply pair. The idea
+    // here being that in the course of each `ping` call each socket only accepts the reply packet
+    // corresponding to the request it just sent and performs a tokio waits between `recv` so that
+    // an outer tokio timeout future can cancel the inner future at the specified icmp timeout.
+    //
+    // One potential limitation here is going to be the number of concurrent pings that can run
+    // since the number of `IcmpSocket` instances is limited. One possibility to address this would
+    // be to use crossbeam's `SegQueue`[1] type which is an unbounded data structure with similar
+    // semantics. In this case we wouldn't even need to initialize the queue here, we could create
+    // new `IcmpSocket`s whenever `SeqQueue.pop` returns None, then push the new socket onto the
+    // queue when its first usage is finished. This would allow the queue to grow to its natural
+    // size for a given set of input parameters (count, interval) and network characteristics
+    // (round trip latency).
+    //
+    // I'm going to stick with ArrayQueue for now because I don't think it's necessary to really
+    // perfect the concurrency characteristics here, it's just something I wanted to point out.
+    //
+    // [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
+    let queue_size = 100usize;
+    let queue: ArrayQueue<IcmpSocket> = ArrayQueue::new(queue_size);
+    for _ in 0..queue_size {
+        let icmp_socket = IcmpSocket::new(addr.clone())?;
+        queue
+            .push(icmp_socket)
+            .expect("don't push more than the queues capacity");
+    }
+
+    let queue = Arc::new(queue);
+
+    let mut interval = tokio::time::interval(Duration::from_millis(interval));
+    let mut set = JoinSet::new();
+
+    for i in 0..count {
+        interval.tick().await;
+        let q = queue.clone();
+        set.spawn(async move { send(q, i).await });
+    }
+
+    while set.join_next().await.is_some() {}
+
+    Ok(())
 }
