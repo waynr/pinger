@@ -22,7 +22,7 @@ const ICMP_REQUEST_PACKET_SIZE: usize = MutableEchoRequestPacket::minimum_packet
 const ICMP_REPLY_PACKET_SIZE: usize =
     Ipv4Packet::minimum_packet_size() + EchoReplyPacket::minimum_packet_size();
 
-async fn ping(q: Arc<ArrayQueue<IcmpSocket>>, seq: u16) {
+async fn ping(q: Arc<ArrayQueue<Box<IcmpSocket>>>, seq: u16) {
     let mut socket = loop {
         log::trace!("try retrieving socket for packet {}", seq);
         match q.pop() {
@@ -307,9 +307,9 @@ async fn main() -> Result<()> {
     //
     // [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
     let queue_size = 100usize;
-    let queue: ArrayQueue<IcmpSocket> = ArrayQueue::new(queue_size);
+    let queue: ArrayQueue<Box<IcmpSocket>> = ArrayQueue::new(queue_size);
     for _ in 0..queue_size {
-        let icmp_socket = IcmpSocket::new(addr.clone(), icmp_timeout.clone())?;
+        let icmp_socket = Box::new(IcmpSocket::new(addr.clone(), icmp_timeout.clone())?);
         queue
             .push(icmp_socket)
             .expect("don't push more than the queues capacity");
