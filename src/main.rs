@@ -22,26 +22,70 @@ const ICMP_REQUEST_PACKET_SIZE: usize = MutableEchoRequestPacket::minimum_packet
 const ICMP_REPLY_PACKET_SIZE: usize =
     Ipv4Packet::minimum_packet_size() + EchoReplyPacket::minimum_packet_size();
 
-async fn ping(q: Arc<ArrayQueue<Box<IcmpSocket>>>, seq: u16) {
-    let mut socket = loop {
-        log::trace!("try retrieving socket for packet {}", seq);
-        match q.pop() {
-            Some(b) => break b,
-            None => {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+struct Pinger {
+    socket_rb: ArrayQueue<Box<IcmpSocket>>,
+}
+
+// A ring buffer of IcmpSockets that makes concurrent pings easy.
+// 
+// # Implementation Notes
+//
+// Rather than using a single socket shared across all packets, we want separate sockets to
+// simplify implementation of echo reply timeout on each echo request-reply pair. The idea
+// here being that in the course of each `ping` call each socket only accepts the reply packet
+// corresponding to the request it just sent and performs a tokio sleeps between non-blocking
+// `recv` attempts so that an outer tokio timeout future can cancel the inner future at the
+// specified icmp timeout.
+//
+// One potential limitation here is going to be the number of concurrent pings that can run
+// since the number of `IcmpSocket` instances is limited using the ArrayQueue. One possibility
+// to address this would be to use crossbeam's `SegQueue`[1] type which is an unbounded data
+// structure with similar semantics. In this case we wouldn't even need to initialize the queue
+// here, we could create new `IcmpSocket`s whenever `SeqQueue.pop` returns None, then push the
+// new socket onto the queue when its first usage is finished. This would allow the queue to
+// grow to its natural size for a given set of input parameters (count, interval) and network
+// characteristics (round trip latency).
+//
+// I'm going to stick with ArrayQueue for now because I don't think it's necessary to really
+// perfect the concurrency characteristics here, it's just something I wanted to point out.
+//
+// [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
+//
+impl Pinger {
+    //fn new(socket_rb: ArrayQueue<Box<IcmpSocket>>) -> Self {
+    fn new(rb_size: usize, icmp_timeout: Duration) -> Result<Self> {
+        let socket_rb: ArrayQueue<Box<IcmpSocket>> = ArrayQueue::new(rb_size);
+        for _ in 0..rb_size {
+            let icmp_socket = Box::new(IcmpSocket::new(icmp_timeout.clone())?);
+            socket_rb
+                .push(icmp_socket)
+                .expect("don't push more than the queues capacity");
         }
-    };
 
-    socket.ping(seq).await;
+        Ok(Self { socket_rb })
+    }
 
-    loop {
-        log::trace!("try pushing socket back onto queue");
-        match q.push(socket) {
-            Ok(_) => break,
-            Err(b) => {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                socket = b;
+    async fn ping(&self, addr: impl AsRef<SockAddr>, seq: u16) {
+        let mut socket = loop {
+            log::trace!("try retrieving socket for packet {}", seq);
+            match self.socket_rb.pop() {
+                Some(b) => break b,
+                None => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        };
+
+        socket.ping(addr, seq).await;
+
+        loop {
+            log::trace!("try pushing socket back onto queue");
+            match self.socket_rb.push(socket) {
+                Ok(_) => break,
+                Err(b) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    socket = b;
+                }
             }
         }
     }
@@ -78,19 +122,18 @@ async fn ping(q: Arc<ArrayQueue<Box<IcmpSocket>>>, seq: u16) {
 struct IcmpSocket {
     inner: Socket,
     icmp_timeout: Duration,
-    addr: SockAddr,
     buf: [u8; ICMP_REQUEST_PACKET_SIZE],
 }
 
 impl IcmpSocket {
-    fn new(addr: SockAddr, icmp_timeout: Duration) -> Result<Self> {
+    fn new(icmp_timeout: Duration) -> Result<Self> {
         let inner = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
 
         inner.set_nonblocking(true)?;
         let rw_timeout = Some(Duration::from_millis(100));
         inner.set_write_timeout(rw_timeout)?;
         inner.set_read_timeout(rw_timeout)?;
-        inner.connect(&addr)?;
+        //inner.connect(&addr)?;
 
         let mut buf = [0u8; ICMP_REQUEST_PACKET_SIZE];
         {
@@ -104,7 +147,6 @@ impl IcmpSocket {
         Ok(Self {
             inner,
             buf,
-            addr,
             icmp_timeout,
         })
     }
@@ -120,37 +162,29 @@ impl IcmpSocket {
         icmp_packet.set_checksum(checksum);
     }
 
-    async fn ping(&mut self, seq: u16) {
+    async fn ping(&mut self, addr: impl AsRef<SockAddr>, seq: u16) {
         let start = Instant::now();
         let icmp_timeout = self.icmp_timeout.clone();
-        let ping_actual = self.ping_actual(seq);
+        let ip = addr.as_ref().as_socket_ipv4().unwrap().ip().clone();
+        let ping_actual = self.ping_actual(addr, seq);
         match timeout(icmp_timeout, ping_actual).await {
-            Err(_elapsed) => println!(
-                "{},{},TIMEDOUT",
-                self.addr.as_socket_ipv4().unwrap().ip(),
-                seq
-            ),
+            Err(_elapsed) => println!("{},{},TIMEDOUT", ip, seq),
             Ok(_) => {
                 let elapsed = start.elapsed();
-                println!(
-                    "{},{},{}",
-                    self.addr.as_socket_ipv4().unwrap().ip(),
-                    seq,
-                    elapsed.as_millis()
-                );
+                println!("{},{},{}", ip, seq, elapsed.as_millis());
             }
         }
     }
 
-    async fn ping_actual(&mut self, seq: u16) {
+    async fn ping_actual(&mut self, addr: impl AsRef<SockAddr>, seq: u16) {
         self.update_icmp_request_packet(seq);
-        self.send_echo_request(seq).await;
+        self.send_echo_request(addr, seq).await;
         self.recv_echo_reply(seq).await;
     }
 
-    async fn send_echo_request(&mut self, seq: u16) {
+    async fn send_echo_request(&mut self, addr: impl AsRef<SockAddr>, seq: u16) {
         loop {
-            match self.inner.send(&self.buf) {
+            match self.inner.send_to(&self.buf, addr.as_ref()) {
                 Err(e) => {
                     if e.kind() == ErrorKind::WouldBlock {
                         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -164,7 +198,6 @@ impl IcmpSocket {
                 }
             }
         }
-
     }
 
     async fn recv_echo_reply(&mut self, seq: u16) {
@@ -281,49 +314,22 @@ fn get_icmp_echo_reply_packet(
 async fn main() -> Result<()> {
     let count: u16 = 5;
     let interval: u64 = 500;
-    let icmp_timeout = Duration::from_millis(5000);
+    let icmp_timeout = Duration::from_millis(22);
 
     let ipv4_addr: Ipv4Addr = "1.1.1.1".parse().expect("should work, right?");
-    let addr: SockAddr = SocketAddrV4::new(ipv4_addr, 0).into();
+    let addr: Box<SockAddr> = Box::new(SocketAddrV4::new(ipv4_addr, 0).into());
 
-    // Rather than using a single socket shared across all packets, we want separate sockets to
-    // simplify implementation of echo reply timeout on each echo request-reply pair. The idea
-    // here being that in the course of each `ping` call each socket only accepts the reply packet
-    // corresponding to the request it just sent and performs a tokio sleeps between non-blocking
-    // `recv` attempts so that an outer tokio timeout future can cancel the inner future at the
-    // specified icmp timeout.
-    //
-    // One potential limitation here is going to be the number of concurrent pings that can run
-    // since the number of `IcmpSocket` instances is limited using the ArrayQueue. One possibility
-    // to address this would be to use crossbeam's `SegQueue`[1] type which is an unbounded data
-    // structure with similar semantics. In this case we wouldn't even need to initialize the queue
-    // here, we could create new `IcmpSocket`s whenever `SeqQueue.pop` returns None, then push the
-    // new socket onto the queue when its first usage is finished. This would allow the queue to
-    // grow to its natural size for a given set of input parameters (count, interval) and network
-    // characteristics (round trip latency).
-    //
-    // I'm going to stick with ArrayQueue for now because I don't think it's necessary to really
-    // perfect the concurrency characteristics here, it's just something I wanted to point out.
-    //
-    // [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
     let queue_size = 100usize;
-    let queue: ArrayQueue<Box<IcmpSocket>> = ArrayQueue::new(queue_size);
-    for _ in 0..queue_size {
-        let icmp_socket = Box::new(IcmpSocket::new(addr.clone(), icmp_timeout.clone())?);
-        queue
-            .push(icmp_socket)
-            .expect("don't push more than the queues capacity");
-    }
-
-    let queue = Arc::new(queue);
+    let pinger = Arc::new(Pinger::new(queue_size, icmp_timeout)?);
 
     let mut interval = tokio::time::interval(Duration::from_millis(interval));
     let mut set = JoinSet::new();
 
     for i in 0..count {
         interval.tick().await;
-        let q = queue.clone();
-        set.spawn(async move { ping(q, i).await });
+        let p = pinger.clone();
+        let a = addr.clone();
+        set.spawn(async move { p.ping(&a, i).await });
     }
 
     while set.join_next().await.is_some() {}
