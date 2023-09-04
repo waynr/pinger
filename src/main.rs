@@ -182,7 +182,7 @@ impl IcmpSocket {
     async fn ping_actual(&mut self, addr: &SockAddr, seq: u16) {
         self.update_icmp_request_packet(seq);
         self.send_echo_request(addr, seq).await;
-        self.recv_echo_reply(seq).await;
+        self.recv_echo_reply(addr, seq).await;
     }
 
     async fn send_echo_request(&mut self, addr: &SockAddr, seq: u16) {
@@ -203,7 +203,7 @@ impl IcmpSocket {
         }
     }
 
-    async fn recv_echo_reply(&mut self, seq: u16) {
+    async fn recv_echo_reply(&mut self, addr: &SockAddr, seq: u16) {
         // "works", but nothing gets written
         //let mut reply_buf: Vec<MaybeUninit<u8>> = Vec::new();
         //let mut reply_slice = reply_buf.as_mut_slice();
@@ -218,6 +218,11 @@ impl IcmpSocket {
         // something other than an ICMP reply from the remote and we should try to be aware when
         // that's happening
         let max_packet_size = ICMP_REPLY_PACKET_SIZE + 100;
+        let ipv4addr = addr
+            .as_socket_ipv4()
+            .expect("we only support ipv4 for now")
+            .ip()
+            .clone();
         loop {
             let mut reply_slice = [MaybeUninit::<u8>::uninit(); ICMP_REPLY_PACKET_SIZE + 100];
             match self.inner.recv(&mut reply_slice) {
@@ -243,7 +248,7 @@ impl IcmpSocket {
                 Ok(bytes_read) => {
                     log::debug!("received {} bytes for reply {}", bytes_read, seq);
                     if let Some(icmp_reply_packet) =
-                        get_icmp_echo_reply_packet(reply_slice, bytes_read)
+                        get_icmp_echo_reply_packet(reply_slice, bytes_read, &ipv4addr)
                     {
                         if icmp_reply_packet.get_sequence_number() == seq {
                             break;
@@ -275,6 +280,7 @@ impl IcmpSocket {
 fn get_icmp_echo_reply_packet(
     buf: [MaybeUninit<u8>; ICMP_REPLY_PACKET_SIZE + 100],
     bytes_read: usize,
+    addr: &Ipv4Addr,
 ) -> Option<EchoReplyPacket<'static>> {
     let mut reply_buf: Vec<u8> = buf
         .into_iter()
@@ -286,11 +292,16 @@ fn get_icmp_echo_reply_packet(
     let ipv4_header_len = {
         let ipv4_packet = Ipv4Packet::new(&reply_buf)
             .expect("packet length already verified to be ICMP_REPLY_PACKET_SIZE");
+        if &ipv4_packet.get_source() != addr {
+            log::debug!("unexpected ipv4 source address");
+            return None;
+        }
         let protocol = ipv4_packet.get_next_level_protocol();
         match protocol {
             IpNextHeaderProtocols::Icmp => (),
             _ => {
-                panic!("unexpected ip next level protocol number: {}", protocol);
+                log::debug!("unexpected ip next level protocol number: {}", protocol);
+                return None;
             }
         }
         {
@@ -298,7 +309,8 @@ fn get_icmp_echo_reply_packet(
             match (icmp_packet.get_icmp_type(), icmp_packet.get_icmp_code()) {
                 (IcmpTypes::EchoReply, IcmpCode(0)) => (),
                 (t, c) => {
-                    panic!("unexpected icmp (type, code): ({:?}, {:?})", t, c);
+                    log::debug!("unexpected icmp (type, code): ({:?}, {:?})", t, c);
+                    return None;
                 }
             }
         }
