@@ -170,8 +170,10 @@ impl IcmpSocket {
             .expect("the buf size should be exactly the minimum icmp packet size");
         icmp_packet.set_sequence_number(seq);
 
-        let checksum =
-            pnet::packet::icmp::checksum(&IcmpPacket::new(icmp_packet.packet()).expect("TODO"));
+        let checksum = pnet::packet::icmp::checksum(
+            &IcmpPacket::new(icmp_packet.packet())
+                .expect("the buf size should be exactly the minimum icmp packet size"),
+        );
         icmp_packet.set_checksum(checksum);
     }
 
@@ -244,15 +246,17 @@ impl IcmpSocket {
                     }
                 }
                 Ok(bytes_read) if bytes_read < ICMP_REPLY_PACKET_SIZE => {
-                    panic!(
+                    log::debug!(
                         "received packet too small {}, expected {}",
-                        bytes_read, ICMP_REPLY_PACKET_SIZE,
+                        bytes_read,
+                        ICMP_REPLY_PACKET_SIZE,
                     );
                 }
                 Ok(bytes_read) if bytes_read > max_packet_size => {
-                    panic!(
+                    log::debug!(
                         "exceeded max packet size {}, received {}",
-                        max_packet_size, bytes_read,
+                        max_packet_size,
+                        bytes_read,
                     );
                 }
                 Ok(bytes_read) => {
@@ -301,7 +305,7 @@ fn get_icmp_echo_reply_packet(
     // check that it's an ICMP packet, comlain if it isn't
     let ipv4_header_len = {
         let ipv4_packet = Ipv4Packet::new(&reply_buf)
-            .expect("packet length already verified to be ICMP_REPLY_PACKET_SIZE");
+            .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
         if &ipv4_packet.get_source() != addr {
             log::debug!("unexpected ipv4 source address");
             return None;
@@ -315,7 +319,8 @@ fn get_icmp_echo_reply_packet(
             }
         }
         {
-            let icmp_packet = IcmpPacket::new(ipv4_packet.payload()).expect("meow");
+            let icmp_packet = IcmpPacket::new(ipv4_packet.payload())
+                .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
             match (icmp_packet.get_icmp_type(), icmp_packet.get_icmp_code()) {
                 (IcmpTypes::EchoReply, IcmpCode(0)) => (),
                 (t, c) => {
@@ -332,7 +337,10 @@ fn get_icmp_echo_reply_packet(
     log::trace!("ipv4 header len: {}", ipv4_header_len);
     let reply_buf: Vec<u8> = reply_buf.drain(ipv4_header_len..).collect();
     log::trace!("echo reply buf len: {}", reply_buf.len());
-    Some(EchoReplyPacket::owned(reply_buf).expect("meow"))
+    Some(
+        EchoReplyPacket::owned(reply_buf)
+            .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE"),
+    )
 }
 
 #[derive(Parser, Debug)]
@@ -363,16 +371,28 @@ async fn main() -> Result<()> {
     for result in rdr.deserialize() {
         let t: Target = result?;
         if t.interval < 1 {
-            return Err(format!("error in target {}: interval must be between 1 and 1000 (ms)", t.addr).into())
+            return Err(format!(
+                "error in target {}: interval must be between 1 and 1000 (ms)",
+                t.addr
+            )
+            .into());
         }
         if t.interval > 1000 {
-            return Err(format!("error in target {}: interval must be between 1 and 1000 (ms)", t.addr).into())
+            return Err(format!(
+                "error in target {}: interval must be between 1 and 1000 (ms)",
+                t.addr
+            )
+            .into());
         }
         if t.count < 1 {
-            return Err(format!("error in target {}: count must be between 1 and 10", t.addr).into())
+            return Err(
+                format!("error in target {}: count must be between 1 and 10", t.addr).into(),
+            );
         }
         if t.count > 10 {
-            return Err(format!("error in target {}: count must be between 1 and 10", t.addr).into())
+            return Err(
+                format!("error in target {}: count must be between 1 and 10", t.addr).into(),
+            );
         }
         targets.push(t);
     }
