@@ -68,7 +68,7 @@ impl Pinger {
         Ok(Self { socket_rb })
     }
 
-    async fn ping(&self, addr: impl AsRef<SockAddr>, seq: u16) {
+    async fn ping(&self, addr: &SockAddr, seq: u16) {
         let mut socket = loop {
             log::trace!("try retrieving socket for packet {}", seq);
             match self.socket_rb.pop() {
@@ -165,10 +165,10 @@ impl IcmpSocket {
         icmp_packet.set_checksum(checksum);
     }
 
-    async fn ping(&mut self, addr: impl AsRef<SockAddr>, seq: u16) {
+    async fn ping(&mut self, addr: &SockAddr, seq: u16) {
         let start = Instant::now();
         let icmp_timeout = self.icmp_timeout.clone();
-        let ip = addr.as_ref().as_socket_ipv4().unwrap().ip().clone();
+        let ip = addr.as_socket_ipv4().unwrap().ip().clone();
         let ping_actual = self.ping_actual(addr, seq);
         match timeout(icmp_timeout, ping_actual).await {
             Err(_elapsed) => println!("{},{},TIMEDOUT", ip, seq),
@@ -179,15 +179,15 @@ impl IcmpSocket {
         }
     }
 
-    async fn ping_actual(&mut self, addr: impl AsRef<SockAddr>, seq: u16) {
+    async fn ping_actual(&mut self, addr: &SockAddr, seq: u16) {
         self.update_icmp_request_packet(seq);
         self.send_echo_request(addr, seq).await;
         self.recv_echo_reply(seq).await;
     }
 
-    async fn send_echo_request(&mut self, addr: impl AsRef<SockAddr>, seq: u16) {
+    async fn send_echo_request(&mut self, addr: &SockAddr, seq: u16) {
         loop {
-            match self.inner.send_to(&self.buf, addr.as_ref()) {
+            match self.inner.send_to(&self.buf, addr) {
                 Err(e) => {
                     if e.kind() == ErrorKind::WouldBlock {
                         tokio::time::sleep(Duration::from_millis(1)).await;
