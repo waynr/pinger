@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+use clap::Parser;
+use csv::{ReaderBuilder, Terminator};
 use pnet::packet::{
     icmp::echo_reply::EchoReplyPacket,
     icmp::{echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket, IcmpTypes},
@@ -14,6 +16,7 @@ use pnet::packet::{
     ipv4::Ipv4Packet,
     Packet,
 };
+use serde::Deserialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -27,7 +30,7 @@ struct Pinger {
 }
 
 // A ring buffer of IcmpSockets that makes concurrent pings easy.
-// 
+//
 // # Implementation Notes
 //
 // Rather than using a single socket shared across all packets, we want separate sockets to
@@ -310,26 +313,57 @@ fn get_icmp_echo_reply_packet(
     Some(EchoReplyPacket::owned(reply_buf).expect("meow"))
 }
 
+#[derive(Parser, Debug)]
+#[command(author, version)]
+struct Cli {
+    targets: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Target {
+    addr: Ipv4Addr,
+    count: u16,
+    interval: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let count: u16 = 5;
-    let interval: u64 = 500;
-    let icmp_timeout = Duration::from_millis(22);
+    let cli = Cli::parse();
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(false)
+        .delimiter(b',')
+        .terminator(Terminator::Any(b'-'))
+        .from_reader(cli.targets.as_bytes());
+    let mut targets: Vec<Target> = Vec::new();
+    for result in rdr.deserialize() {
+        let t: Target = result?;
+        targets.push(t);
+    }
 
-    let ipv4_addr: Ipv4Addr = "1.1.1.1".parse().expect("should work, right?");
-    let addr: Box<SockAddr> = Box::new(SocketAddrV4::new(ipv4_addr, 0).into());
+    let icmp_timeout = Duration::from_millis(5000);
 
     let queue_size = 100usize;
     let pinger = Arc::new(Pinger::new(queue_size, icmp_timeout)?);
 
-    let mut interval = tokio::time::interval(Duration::from_millis(interval));
     let mut set = JoinSet::new();
 
-    for i in 0..count {
-        interval.tick().await;
+    for target in targets.into_iter() {
         let p = pinger.clone();
-        let a = addr.clone();
-        set.spawn(async move { p.ping(&a, i).await });
+        set.spawn(async move {
+            let mut set = JoinSet::new();
+
+            let p = p.clone();
+            let mut interval = tokio::time::interval(Duration::from_millis(target.interval));
+            let addr: Box<SockAddr> = Box::new(SocketAddrV4::new(target.addr, 0).into());
+            for i in 0..target.count {
+                interval.tick().await;
+                let a = addr.clone();
+                let p = p.clone();
+                set.spawn(async move { p.ping(&a, i).await });
+            }
+
+            while set.join_next().await.is_some() {}
+        });
     }
 
     while set.join_next().await.is_some() {}

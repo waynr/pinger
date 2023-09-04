@@ -1,7 +1,9 @@
 [package]
-name = "firezone-ping"
+name = "rmap"
 version = "0.1.0"
 edition = "2021"
+authors = ["Wayne Warren"]
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -12,3 +14,7 @@ pnet = "0.33.0"
 socket2 = "0.5.1"
 tokio = { version = "1.28", features = ["full"] }
 crossbeam = "0.8.2"
+
+clap = { version = "4.4.2", features = ["derive"] }
+csv = "1.2.2"
+serde = { version = "1.0", features = ["derive"] }
