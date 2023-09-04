@@ -184,7 +184,7 @@ impl IcmpSocket {
             Err(_elapsed) => println!("{},{},TIMEDOUT", ip, seq),
             Ok(_) => {
                 let elapsed = start.elapsed();
-                println!("{},{},{}", ip, seq, elapsed.as_millis());
+                println!("{},{},{}", ip, seq, elapsed.as_micros());
             }
         }
     }
@@ -200,7 +200,7 @@ impl IcmpSocket {
             match self.inner.send_to(&self.buf, addr) {
                 Err(e) => {
                     if e.kind() == ErrorKind::WouldBlock {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        tokio::time::sleep(Duration::from_micros(1)).await;
                     } else {
                         panic!("unhandled socket send error: {}", e);
                     }
