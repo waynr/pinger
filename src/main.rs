@@ -246,7 +246,6 @@ impl IcmpSocket {
         // note: we create a bigger array than ICMP_REPLY_PACKET_SIZE because it's possible we get
         // something other than an ICMP reply from the remote and we should try to be aware when
         // that's happening
-        let max_packet_size = ICMP_REPLY_PACKET_SIZE + 100;
         let ipv4addr = addr
             .as_socket_ipv4()
             .expect("we only support ipv4 for now")
@@ -258,28 +257,43 @@ impl IcmpSocket {
                 Err(e) => {
                     panic!("unhandled socket read error: {}", e);
                 }
-                Ok(bytes_read) if bytes_read < ICMP_REPLY_PACKET_SIZE => {
-                    log::debug!(
-                        "received packet too small {}, expected {}",
-                        bytes_read,
-                        ICMP_REPLY_PACKET_SIZE,
-                    );
-                }
-                Ok(bytes_read) if bytes_read > max_packet_size => {
-                    log::debug!(
-                        "exceeded max packet size {}, received {}",
-                        max_packet_size,
-                        bytes_read,
-                    );
-                }
                 Ok(bytes_read) => {
+                    // Transmute an owned array of `MaybeUninit<u8>` into `Vec<u8>` then check if
+                    // it's the packet we're looking for.
+                    //
+                    // Note that while dropping `MaybeUninit` values doesn't drop the contained
+                    // value [1], in this case we rely on the fact that only up to `bytes_read`
+                    // elements have been written to by the socket library, all other elements are
+                    // actually uninitialized and therefore safe to be dropped in this function.
+                    // The elements up to `bytes_read` are properly converted into `u8` and
+                    // therefore will be properly dropped either by this method or by the calling
+                    // context once it takes ownership of the `EchoReplyPacket<'static>` return
+                    // value.
+                    //
+                    // There is however, a small risk of memory leak IF the program panics while
+                    // iterating over the initialized values of `buf` [2]. But if the program does
+                    // panic, it's not like we're recovering it anywhere so the entire program
+                    // should terminate and memory returned to the kernel.
+                    //
+                    // [1] https://doc.rust-lang.org/stable/std/mem/union.MaybeUninit.html#method.new
+                    // [2] https://doc.rust-lang.org/stable/std/mem/union.MaybeUninit.html#initializing-an-array-element-by-element
+                    let reply_buf: Vec<u8> = reply_slice
+                        .into_iter()
+                        .take(bytes_read)
+                        .map(|m| unsafe { std::mem::transmute::<_, u8>(m) })
+                        .collect();
                     log::debug!("received {} bytes for reply {}", bytes_read, seq);
-                    if let Some(icmp_reply_packet) =
-                        get_icmp_echo_reply_packet(reply_slice, bytes_read, &ipv4addr)
-                    {
-                        if icmp_reply_packet.get_sequence_number() == seq {
-                            break;
-                        }
+                    if bytes_read < ICMP_REPLY_PACKET_SIZE {
+                        log::debug!(
+                            "received packet too small {}, expected {}",
+                            bytes_read,
+                            ICMP_REPLY_PACKET_SIZE,
+                        );
+                        continue;
+                    }
+
+                    if is_expected_packet(&reply_buf, &ipv4addr, seq) {
+                        break;
                     }
                 }
             }
@@ -287,50 +301,29 @@ impl IcmpSocket {
     }
 }
 
-/// Transmute an owned array of `MaybeUninit<u8>` into `Vec<u8>`, check that it's the right kind of
-/// IP/ICMP packet, then give ownership of the `Vec<u8>` over to a `EchoReplyPacket<'static>` if
-/// everything goes well.
-///
-/// Note that while dropping `MaybeUninit` values doesn't drop the contained value [1], in this
-/// case we rely on the fact that only up to `bytes_read` elements have been written to by the
-/// socket library, all other elements are actually uninitialized and therefore safe to be dropped
-/// in this function. The elements up to `bytes_read` are properly converted into `u8` and
-/// therefore will be properly dropped either by this method or by the calling context once it
-/// takes ownership of the `EchoReplyPacket<'static>` return value.
-///
-/// There is however, a small risk of memory leak IF the program panics while iterating over the
-/// initialized values of `buf` [2]. But if the program does panic, it's not like we're recovering
-/// it anywhere so the entire program should terminate and memory returned to the kernel.
-///
-/// [1] https://doc.rust-lang.org/stable/std/mem/union.MaybeUninit.html#method.new
-/// [2] https://doc.rust-lang.org/stable/std/mem/union.MaybeUninit.html#initializing-an-array-element-by-element
-fn get_icmp_echo_reply_packet(
-    buf: [MaybeUninit<u8>; ICMP_REPLY_PACKET_SIZE + 100],
-    bytes_read: usize,
-    addr: &Ipv4Addr,
-) -> Option<EchoReplyPacket<'static>> {
-    let mut reply_buf: Vec<u8> = buf
-        .into_iter()
-        .take(bytes_read)
-        .map(|m| unsafe { std::mem::transmute::<_, u8>(m) })
-        .collect();
-
-    // check that it's an ICMP packet, comlain if it isn't
+/// Check that the given buffer is:
+/// * from the expected source IP
+/// * the right kind of IP packet (ICMP)
+/// * the right kind of ICMP packet (Echo Reply)
+/// * the expected sequence number
+fn is_expected_packet(reply_buf: &[u8], addr: &Ipv4Addr, seq: u16) -> bool {
+    // check that it's an ICMP packet
     let ipv4_header_len = {
         let ipv4_packet = Ipv4Packet::new(&reply_buf)
             .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
         if &ipv4_packet.get_source() != addr {
             log::debug!("unexpected ipv4 source address");
-            return None;
+            return false;
         }
         let protocol = ipv4_packet.get_next_level_protocol();
         match protocol {
             IpNextHeaderProtocols::Icmp => (),
             _ => {
                 log::debug!("unexpected ip next level protocol number: {}", protocol);
-                return None;
+                return false;
             }
         }
+        // check that it's the right ICMP packet type
         {
             let icmp_packet = IcmpPacket::new(ipv4_packet.payload())
                 .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
@@ -338,7 +331,7 @@ fn get_icmp_echo_reply_packet(
                 (IcmpTypes::EchoReply, IcmpCode(0)) => (),
                 (t, c) => {
                     log::debug!("unexpected icmp (type, code): ({:?}, {:?})", t, c);
-                    return None;
+                    return false;
                 }
             }
         }
@@ -348,12 +341,12 @@ fn get_icmp_echo_reply_packet(
     };
 
     log::trace!("ipv4 header len: {}", ipv4_header_len);
-    let reply_buf: Vec<u8> = reply_buf.drain(ipv4_header_len..).collect();
+    let reply_buf = &reply_buf[ipv4_header_len..];
     log::trace!("echo reply buf len: {}", reply_buf.len());
-    Some(
-        EchoReplyPacket::owned(reply_buf)
-            .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE"),
-    )
+    let reply_packet = EchoReplyPacket::new(reply_buf)
+        .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
+
+    reply_packet.get_sequence_number() == seq
 }
 
 #[derive(Parser, Debug)]
