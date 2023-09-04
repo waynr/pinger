@@ -130,6 +130,16 @@ struct IcmpSocket {
 
 impl IcmpSocket {
     fn new(icmp_timeout: Duration) -> Result<Self> {
+        // NOTE: I originally wrote this using Domain::PACKET and Type::RAW because i was trying to
+        // be fancy in my re-use of buffers; however, when I switched to Domain::IPV4 I neglected
+        // to change Type::RAW to TYPE::DGRAM. there are two consequences:
+        //
+        // * this program needs to be explicitly given permission to open raw sockets either by
+        // running as root or giving it `cap_net_admin,cap_net_raw+ep` capabilites
+        //
+        // * when receiving packets (but not when sending), we need to interpret not just the ICMP
+        // protocol but also the encapsulating IPv4 protocol; this may not be necessary if we used
+        // Type::DGRAM, but I'm not going to spend the time refactoring that element right now
         let inner = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
 
         inner.set_nonblocking(true)?;

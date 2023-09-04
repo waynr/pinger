@@ -56,3 +56,10 @@ $ echo '1.1.1.1,30,100;8.8.8.8,3,1000' | xargs ./target/debug/pingers
 1.1.1.1,28,19
 1.1.1.1,29,21
 ```
+
+**Note**: this either needs to be run as root OR the binary needs to be given
+enhanced network-related capabilities, eg:
+
+```
+# setcap cap_net_admin,cap_net_raw+ep ./target/debug/pingers
+```
