@@ -332,7 +332,7 @@ async fn main() -> Result<()> {
     let mut rdr = ReaderBuilder::new()
         .has_headers(false)
         .delimiter(b',')
-        .terminator(Terminator::Any(b'-'))
+        .terminator(Terminator::Any(b';'))
         .from_reader(cli.targets.as_bytes());
     let mut targets: Vec<Target> = Vec::new();
     for result in rdr.deserialize() {
