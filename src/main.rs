@@ -374,6 +374,7 @@ struct Target {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
     let cli = Cli::parse();
     let mut rdr = ReaderBuilder::new()
         .has_headers(false)
