@@ -362,6 +362,18 @@ async fn main() -> Result<()> {
     let mut targets: Vec<Target> = Vec::new();
     for result in rdr.deserialize() {
         let t: Target = result?;
+        if t.interval < 1 {
+            return Err(format!("error in target {}: interval must be between 1 and 1000 (ms)", t.addr).into())
+        }
+        if t.interval > 1000 {
+            return Err(format!("error in target {}: interval must be between 1 and 1000 (ms)", t.addr).into())
+        }
+        if t.count < 1 {
+            return Err(format!("error in target {}: count must be between 1 and 10", t.addr).into())
+        }
+        if t.count > 10 {
+            return Err(format!("error in target {}: count must be between 1 and 10", t.addr).into())
+        }
         targets.push(t);
     }
 
