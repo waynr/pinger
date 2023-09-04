@@ -176,7 +176,7 @@ impl IcmpSocket {
 
     async fn send_to(&self, addr: &SockAddr) -> std::io::Result<usize> {
         loop {
-            let mut guard = self.inner.readable().await?;
+            let mut guard = self.inner.writable().await?;
 
             match guard.try_io(|inner| inner.get_ref().send_to(&self.buf, addr)) {
                 Ok(result) => return result,
