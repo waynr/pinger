@@ -143,7 +143,7 @@ impl IcmpSocket {
         let inner = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
 
         inner.set_nonblocking(true)?;
-        let rw_timeout = Some(Duration::from_millis(100));
+        let rw_timeout = Some(Duration::from_millis(1));
         inner.set_write_timeout(rw_timeout)?;
         inner.set_read_timeout(rw_timeout)?;
 
