@@ -1,5 +1,4 @@
 use crossbeam::queue::ArrayQueue;
-use std::io::ErrorKind;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
@@ -18,6 +17,7 @@ use pnet::packet::{
 };
 use serde::Deserialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use tokio::io::unix::AsyncFd;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -123,7 +123,7 @@ impl Pinger {
 /// [1] https://zmap.io/paper.pdf
 #[derive(Debug)]
 struct IcmpSocket {
-    inner: Socket,
+    inner: AsyncFd<Socket>,
     icmp_timeout: Duration,
     buf: [u8; ICMP_REQUEST_PACKET_SIZE],
 }
@@ -146,7 +146,6 @@ impl IcmpSocket {
         let rw_timeout = Some(Duration::from_millis(100));
         inner.set_write_timeout(rw_timeout)?;
         inner.set_read_timeout(rw_timeout)?;
-        //inner.connect(&addr)?;
 
         let mut buf = [0u8; ICMP_REQUEST_PACKET_SIZE];
         {
@@ -158,10 +157,32 @@ impl IcmpSocket {
         }
 
         Ok(Self {
-            inner,
+            inner: AsyncFd::new(inner)?,
             buf,
             icmp_timeout,
         })
+    }
+
+    async fn recv(&self, out: &mut [MaybeUninit<u8>]) -> std::io::Result<usize> {
+        loop {
+            let mut guard = self.inner.readable().await?;
+
+            match guard.try_io(|inner| inner.get_ref().recv(out)) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    async fn send_to(&self, addr: &SockAddr) -> std::io::Result<usize> {
+        loop {
+            let mut guard = self.inner.readable().await?;
+
+            match guard.try_io(|inner| inner.get_ref().send_to(&self.buf, addr)) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
     }
 
     /// Updates the icmp buffer with the current icmp sequence and the new icmp checksum.
@@ -199,13 +220,9 @@ impl IcmpSocket {
 
     async fn send_echo_request(&mut self, addr: &SockAddr, seq: u16) {
         loop {
-            match self.inner.send_to(&self.buf, addr) {
+            match self.send_to(addr).await {
                 Err(e) => {
-                    if e.kind() == ErrorKind::WouldBlock {
-                        tokio::time::sleep(Duration::from_micros(1)).await;
-                    } else {
-                        panic!("unhandled socket send error: {}", e);
-                    }
+                    panic!("unhandled socket send error: {}", e);
                 }
                 Ok(length) => {
                     log::debug!("sent {} bytes for request {}", length, seq);
@@ -237,13 +254,9 @@ impl IcmpSocket {
             .clone();
         loop {
             let mut reply_slice = [MaybeUninit::<u8>::uninit(); ICMP_REPLY_PACKET_SIZE + 100];
-            match self.inner.recv(&mut reply_slice) {
+            match self.recv(&mut reply_slice).await {
                 Err(e) => {
-                    if e.kind() == ErrorKind::WouldBlock {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    } else {
-                        panic!("unhandled socket send error: {}", e);
-                    }
+                    panic!("unhandled socket read error: {}", e);
                 }
                 Ok(bytes_read) if bytes_read < ICMP_REPLY_PACKET_SIZE => {
                     log::debug!(
