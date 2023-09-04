@@ -339,6 +339,9 @@ fn get_icmp_echo_reply_packet(
 #[command(author, version)]
 struct Cli {
     targets: String,
+
+    #[arg(default_value_t = 5000, short, long)]
+    icmp_timeout: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,7 +365,7 @@ async fn main() -> Result<()> {
         targets.push(t);
     }
 
-    let icmp_timeout = Duration::from_millis(5000);
+    let icmp_timeout = Duration::from_millis(cli.icmp_timeout);
 
     let queue_size = 100usize;
     let pinger = Arc::new(Pinger::new(queue_size, icmp_timeout)?);
