@@ -199,23 +199,19 @@ impl IcmpSocket {
     }
 
     async fn ping(&mut self, addr: &SockAddr, seq: u16) {
+        self.update_icmp_request_packet(seq);
+        self.send_echo_request(addr, seq).await;
+
         let start = Instant::now();
         let icmp_timeout = self.icmp_timeout.clone();
         let ip = addr.as_socket_ipv4().unwrap().ip().clone();
-        let ping_actual = self.ping_actual(addr, seq);
-        match timeout(icmp_timeout, ping_actual).await {
+        match timeout(icmp_timeout, self.recv_echo_reply(addr, seq)).await {
             Err(_elapsed) => println!("{},{},TIMEDOUT", ip, seq),
             Ok(_) => {
                 let elapsed = start.elapsed();
                 println!("{},{},{}", ip, seq, elapsed.as_micros());
             }
         }
-    }
-
-    async fn ping_actual(&mut self, addr: &SockAddr, seq: u16) {
-        self.update_icmp_request_packet(seq);
-        self.send_echo_request(addr, seq).await;
-        self.recv_echo_reply(addr, seq).await;
     }
 
     async fn send_echo_request(&mut self, addr: &SockAddr, seq: u16) {
