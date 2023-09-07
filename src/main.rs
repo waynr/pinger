@@ -61,7 +61,6 @@ struct Pinger {
 // [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
 //
 impl Pinger {
-    //fn new(socket_rb: ArrayQueue<Box<IcmpSocket>>) -> Self {
     fn new(rb_size: usize, icmp_timeout: Duration) -> Result<Self> {
         let socket_rb: ArrayQueue<Box<IcmpSocket>> = ArrayQueue::new(rb_size);
         for _ in 0..rb_size {
@@ -222,12 +221,13 @@ impl IcmpSocket {
 
     async fn send_echo_request(&mut self, addr: &SockAddr, seq: u16) {
         loop {
+            log::trace!("about to try sending via async io");
             match self.send_to(addr).await {
                 Err(e) => {
                     panic!("unhandled socket send error: {}", e);
                 }
                 Ok(length) => {
-                    log::debug!("sent {} bytes for request {}", length, seq);
+                    log::trace!("sent {} bytes for request {}", length, seq);
                     break;
                 }
             }
@@ -284,9 +284,9 @@ impl IcmpSocket {
                         .take(bytes_read)
                         .map(|m| unsafe { std::mem::transmute::<_, u8>(m) })
                         .collect();
-                    log::debug!("received {} bytes for reply {}", bytes_read, seq);
+                    log::trace!("received {} bytes for reply {}", bytes_read, seq);
                     if bytes_read < ICMP_REPLY_PACKET_SIZE {
-                        log::debug!(
+                        log::trace!(
                             "received packet too small {}, expected {}",
                             bytes_read,
                             ICMP_REPLY_PACKET_SIZE,
@@ -313,15 +313,16 @@ fn is_expected_packet(reply_buf: &[u8], addr: &Ipv4Addr, seq: u16) -> bool {
     let ipv4_header_len = {
         let ipv4_packet = Ipv4Packet::new(&reply_buf)
             .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
-        if &ipv4_packet.get_source() != addr {
-            log::debug!("unexpected ipv4 source address");
+        let source = &ipv4_packet.get_source();
+        if source != addr {
+            log::trace!("unexpected ipv4 source address: {source}");
             return false;
         }
         let protocol = ipv4_packet.get_next_level_protocol();
         match protocol {
             IpNextHeaderProtocols::Icmp => (),
             _ => {
-                log::debug!("unexpected ip next level protocol number: {}", protocol);
+                log::trace!("unexpected ip next level protocol number: {}", protocol);
                 return false;
             }
         }
@@ -332,7 +333,7 @@ fn is_expected_packet(reply_buf: &[u8], addr: &Ipv4Addr, seq: u16) -> bool {
             match (icmp_packet.get_icmp_type(), icmp_packet.get_icmp_code()) {
                 (IcmpTypes::EchoReply, IcmpCode(0)) => (),
                 (t, c) => {
-                    log::debug!("unexpected icmp (type, code): ({:?}, {:?})", t, c);
+                    log::trace!("unexpected icmp (type, code): ({:?}, {:?})", t, c);
                     return false;
                 }
             }
