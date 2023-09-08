@@ -61,10 +61,10 @@ struct Pinger {
 // [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
 //
 impl Pinger {
-    fn new(rb_size: usize, icmp_timeout: Duration) -> Result<Self> {
+    fn new(ethernet_conf: EthernetConf, rb_size: usize, icmp_timeout: Duration) -> Result<Self> {
         let socket_rb: ArrayQueue<Box<IcmpSocket>> = ArrayQueue::new(rb_size);
         for _ in 0..rb_size {
-            let icmp_socket = Box::new(IcmpSocket::new(icmp_timeout.clone())?);
+            let icmp_socket = Box::new(IcmpSocket::new(&ethernet_conf, icmp_timeout.clone())?);
             socket_rb
                 .push(icmp_socket)
                 .expect("don't push more than the queues capacity");
@@ -99,18 +99,14 @@ impl Pinger {
     }
 }
 
-/// Abstraction for containing individual socket instances and pre-allocated ICMP buffer.
+/// Abstraction for containing individual socket instances and pre-allocated Ethernet packet
+/// buffer.
 ///
 /// # Notes on Socket choice:
 ///
-/// So I tried using Domain::PACKET, but both `bind` and `send` socket methods were
-/// failing with EINVAL errors, which suggests to me that the `socket2` crate may not be
-/// handling those calls correctly for Domain::PACKET sockets (or I just haven't figured out
-/// what else I needed to do to make it work beyond manually constructing an ipv4 buffer).
-///
-/// The reason I wanted to use Domain::PACKET is that I have been reading the `zmap` paper
-/// recently[1] and learned one of the tricks they use to achieve such high packet throughput
-/// is to use AF_PACKET and manually construct Ethernet packets. This has two primary benefits:
+/// The reason I choose Domain::PACKET is that I have been reading the `zmap` paper recently[1] and
+/// learned one of the tricks they use to achieve such high packet throughput is to use AF_PACKET
+/// and manually construct Ethernet packets. This has two primary benefits:
 ///
 /// First, it bypasses TCP/IP/whatever handling at the kernel level. This reduces kernel-specific
 /// cpu and memory overhead in high throughput applications.
@@ -134,18 +130,44 @@ struct IcmpSocket {
 }
 
 impl IcmpSocket {
-    fn new(icmp_timeout: Duration) -> Result<Self> {
-        // NOTE: I originally wrote this using Domain::PACKET and Type::RAW because i was trying to
-        // be fancy in my re-use of buffers; however, when I switched to Domain::IPV4 I neglected
-        // to change Type::RAW to TYPE::DGRAM. there are two consequences:
+    fn new(ethernet_conf: &EthernetConf, icmp_timeout: Duration) -> Result<Self> {
+        // choose Domain::PACKET here so that we can cache ICMP reply packets and circumvent
+        // network-layer handling of packets in the kernel
+        let inner = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::ICMPV4))?;
+
+        // initialize sockaddr_storage then reference as raw pointer to a sockaddr_ll in order to
+        // set link-layer options on the addr before binding the socket. the intent here is to bind
+        // the AF_PACKET socket by index to the interface in the given EthernetConf.
         //
-        // * this program needs to be explicitly given permission to open raw sockets either by
-        // running as root or giving it `cap_net_admin,cap_net_raw+ep` capabilites
-        //
-        // * when receiving packets (but not when sending), we need to interpret not just the ICMP
-        // protocol but also the encapsulating IPv4 protocol; this may not be necessary if we used
-        // Type::DGRAM, but I'm not going to spend the time refactoring that element right now
-        let inner = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
+        // it's safe to initialize a sockaddr_storage to all zeroes because zeroes are valid values
+        // for its fields.
+        let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        {
+            // I don't really understand why this line isn't considered unsafe by the compiler
+            let mut addr_ll_ref: *mut libc::sockaddr_ll =
+                (&mut addr_storage as *mut libc::sockaddr_storage).cast();
+
+            // these operations are safe because according to 'man sockaddr_storage' it is designed
+            // to be at least as large as any other sockaddr_* libc type and cast to any of those
+            // types (such as sockaddr_ll here) so that the needed fields for the sockaddr_* type
+            // can be set
+            unsafe {
+                (*addr_ll_ref).sll_family = libc::AF_PACKET as u16;
+                (*addr_ll_ref).sll_ifindex = ethernet_conf.interface.index as i32;
+                (*addr_ll_ref).sll_protocol = libc::IPPROTO_ICMP as u16;
+                log::debug!("sockaddr_ll for bind set to: {:?}", *addr_ll_ref);
+            }
+        }
+        let len = std::mem::size_of_val(&addr_storage) as libc::socklen_t;
+
+        // the following is safe because of the abovementioned explanations regarding initializing
+        // the sockaddr_storage bits to 0 and casting to a sockaddr_ll to set link-layer fields for
+        // the sockaddr; so we have correctly constructed our sockaddr_storage.
+        let addr = unsafe { SockAddr::new(addr_storage, len) };
+
+        // trying to bind any other type of SockAddr (eg Ipv4Addr) than what we have initialized
+        // above would fail for an AF_PACKET with an EINVAL OS error.
+        inner.bind(&addr)?;
 
         inner.set_nonblocking(true)?;
         let rw_timeout = Some(Duration::from_millis(1));
@@ -628,18 +650,18 @@ async fn main() -> Result<()> {
         targets.push(t);
     }
 
-    let packet_conf = if let Some(interface_name) = cli.interface {
+    let ethernet_conf = if let Some(interface_name) = cli.interface {
         EthernetConf::new(interface_name).await?
     } else {
         EthernetConf::any().await?
     };
 
-    log::debug!("ethernet config: {:?}", packet_conf);
+    log::debug!("ethernet config: {:?}", ethernet_conf);
 
     let icmp_timeout = Duration::from_millis(cli.icmp_timeout);
 
     let queue_size = 100usize;
-    let pinger = Arc::new(Pinger::new(queue_size, icmp_timeout)?);
+    let pinger = Arc::new(Pinger::new(ethernet_conf, queue_size, icmp_timeout)?);
 
     let mut set = JoinSet::new();
 
