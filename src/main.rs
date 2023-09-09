@@ -68,10 +68,10 @@ struct Pinger {
 //
 impl Pinger {
     fn new(ethernet_conf: EthernetConf, rb_size: usize, icmp_timeout: Duration) -> Result<Self> {
-        let sender = Arc::new(AsyncFd::new(Self::create_socket(&ethernet_conf, true)?)?);
+        let sender = Arc::new(AsyncFd::new(Self::create_sender(&ethernet_conf)?)?);
         let socket_rb: ArrayQueue<Box<IcmpSocket>> = ArrayQueue::new(rb_size);
         for _ in 0..rb_size {
-            let receiver = Self::create_socket(&ethernet_conf, false)?;
+            let receiver = Self::create_receiver()?;
             let icmp_socket = Box::new(IcmpSocket::new(
                 sender.clone(),
                 receiver,
@@ -86,23 +86,29 @@ impl Pinger {
         Ok(Self { socket_rb })
     }
 
-    fn create_socket(ethernet_conf: &EthernetConf, bind: bool) -> Result<Socket> {
+    fn create_receiver() -> Result<Socket> {
         // choose Domain::PACKET here so that we can cache ICMP reply packets and circumvent
         // network-layer handling of packets in the kernel
-        let socket = Socket::new(
-            Domain::PACKET,
-            Type::RAW,
-            Some(Protocol::from(libc::ETH_P_ALL.to_be())),
-        )?;
+        //Some(Protocol::from(libc::ETH_P_ALL.to_be())),
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
 
         socket.set_nonblocking(true)?;
         let rw_timeout = Some(Duration::from_millis(1));
         socket.set_write_timeout(rw_timeout)?;
         socket.set_read_timeout(rw_timeout)?;
 
-        if !bind {
-            return Ok(socket)
-        }
+        Ok(socket)
+    }
+
+    fn create_sender(ethernet_conf: &EthernetConf) -> Result<Socket> {
+        // choose Domain::PACKET here so that we can cache ICMP reply packets and circumvent
+        // network-layer handling of packets in the kernel
+        let socket = Socket::new(Domain::PACKET, Type::RAW, None)?;
+
+        socket.set_nonblocking(true)?;
+        let rw_timeout = Some(Duration::from_millis(1));
+        socket.set_write_timeout(rw_timeout)?;
+        socket.set_read_timeout(rw_timeout)?;
 
         // initialize sockaddr_storage then reference as raw pointer to a sockaddr_ll in order to
         // set link-layer options on the addr before binding the socket. the intent here is to bind
