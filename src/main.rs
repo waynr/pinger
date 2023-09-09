@@ -310,12 +310,13 @@ impl IcmpSocket {
     async fn ping(&mut self, addr: &SockAddr, seq: u16) {
         let ip = addr.as_socket_ipv4().unwrap().ip().clone();
         self.update_icmp_request_packet(&ip, seq);
+        let recv_echo_reply_fut = self.recv_echo_reply(addr, seq);
         self.send_echo_request(seq).await;
 
         let start = Instant::now();
         let icmp_timeout = self.icmp_timeout.clone();
         let ip = addr.as_socket_ipv4().unwrap().ip().clone();
-        match timeout(icmp_timeout, self.recv_echo_reply(addr, seq)).await {
+        match timeout(icmp_timeout, recv_echo_reply_fut).await {
             Err(_elapsed) => println!("{},{},TIMEDOUT", ip, seq),
             Ok(_) => {
                 let elapsed = start.elapsed();
@@ -324,7 +325,7 @@ impl IcmpSocket {
         }
     }
 
-    async fn send_echo_request(&mut self, seq: u16) {
+    async fn send_echo_request(&self, seq: u16) {
         loop {
             log::trace!("about to try sending via async io");
             match self.send().await {
@@ -339,7 +340,7 @@ impl IcmpSocket {
         }
     }
 
-    async fn recv_echo_reply(&mut self, addr: &SockAddr, seq: u16) {
+    async fn recv_echo_reply(&self, addr: &SockAddr, seq: u16) {
         // "works", but nothing gets written
         //let mut reply_buf: Vec<MaybeUninit<u8>> = Vec::new();
         //let mut reply_slice = reply_buf.as_mut_slice();
