@@ -272,11 +272,11 @@ impl IcmpSocket {
         }
     }
 
-    async fn send_to(&self, addr: &SockAddr) -> std::io::Result<usize> {
+    async fn send(&self) -> std::io::Result<usize> {
         loop {
             let mut guard = self.sender.writable().await?;
 
-            match guard.try_io(|sender| sender.get_ref().send_to(&self.buf, addr)) {
+            match guard.try_io(|sender| sender.get_ref().send(&self.buf)) {
                 Ok(result) => return result,
                 Err(_would_block) => continue,
             }
@@ -310,7 +310,7 @@ impl IcmpSocket {
     async fn ping(&mut self, addr: &SockAddr, seq: u16) {
         let ip = addr.as_socket_ipv4().unwrap().ip().clone();
         self.update_icmp_request_packet(&ip, seq);
-        self.send_echo_request(addr, seq).await;
+        self.send_echo_request(seq).await;
 
         let start = Instant::now();
         let icmp_timeout = self.icmp_timeout.clone();
@@ -324,10 +324,10 @@ impl IcmpSocket {
         }
     }
 
-    async fn send_echo_request(&mut self, addr: &SockAddr, seq: u16) {
+    async fn send_echo_request(&mut self, seq: u16) {
         loop {
             log::trace!("about to try sending via async io");
-            match self.send_to(addr).await {
+            match self.send().await {
                 Err(e) => {
                     panic!("unhandled socket send error: {}", e);
                 }
