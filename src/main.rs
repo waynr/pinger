@@ -68,10 +68,16 @@ struct Pinger {
 //
 impl Pinger {
     fn new(ethernet_conf: EthernetConf, rb_size: usize, icmp_timeout: Duration) -> Result<Self> {
+        let sender = Arc::new(AsyncFd::new(Self::create_socket(&ethernet_conf)?)?);
         let socket_rb: ArrayQueue<Box<IcmpSocket>> = ArrayQueue::new(rb_size);
         for _ in 0..rb_size {
-            let inner = Self::create_socket(&ethernet_conf)?;
-            let icmp_socket = Box::new(IcmpSocket::new(inner, &ethernet_conf, icmp_timeout.clone())?);
+            let receiver = Self::create_socket(&ethernet_conf)?;
+            let icmp_socket = Box::new(IcmpSocket::new(
+                sender.clone(),
+                receiver,
+                &ethernet_conf,
+                icmp_timeout.clone(),
+            )?);
             socket_rb
                 .push(icmp_socket)
                 .expect("don't push more than the queues capacity");
@@ -185,14 +191,19 @@ impl Pinger {
 /// [1] https://zmap.io/paper.pdf
 #[derive(Debug)]
 struct IcmpSocket {
-    inner: AsyncFd<Socket>,
+    sender: Arc<AsyncFd<Socket>>,
+    receiver: AsyncFd<Socket>,
     icmp_timeout: Duration,
     buf: [u8; ICMP_REQUEST_PACKET_SIZE],
 }
 
 impl IcmpSocket {
-    fn new(socket: Socket, ethernet_conf: &EthernetConf, icmp_timeout: Duration) -> Result<Self> {
-
+    fn new(
+        sender: Arc<AsyncFd<Socket>>,
+        receiver: Socket,
+        ethernet_conf: &EthernetConf,
+        icmp_timeout: Duration,
+    ) -> Result<Self> {
         let mut buf = [0u8; ICMP_REQUEST_PACKET_SIZE];
         {
             let mut ethernet_packet = MutableEthernetPacket::new(&mut buf).expect("meow");
@@ -239,7 +250,8 @@ impl IcmpSocket {
         }
 
         Ok(Self {
-            inner: AsyncFd::new(socket)?,
+            sender: sender,
+            receiver: AsyncFd::new(receiver)?,
             buf,
             icmp_timeout,
         })
@@ -247,9 +259,9 @@ impl IcmpSocket {
 
     async fn recv(&self, out: &mut [MaybeUninit<u8>]) -> std::io::Result<usize> {
         loop {
-            let mut guard = self.inner.readable().await?;
+            let mut guard = self.receiver.readable().await?;
 
-            match guard.try_io(|inner| inner.get_ref().recv(out)) {
+            match guard.try_io(|receiver| receiver.get_ref().recv(out)) {
                 Ok(result) => return result,
                 Err(_would_block) => continue,
             }
@@ -258,9 +270,9 @@ impl IcmpSocket {
 
     async fn send_to(&self, addr: &SockAddr) -> std::io::Result<usize> {
         loop {
-            let mut guard = self.inner.writable().await?;
+            let mut guard = self.sender.writable().await?;
 
-            match guard.try_io(|inner| inner.get_ref().send_to(&self.buf, addr)) {
+            match guard.try_io(|sender| sender.get_ref().send_to(&self.buf, addr)) {
                 Ok(result) => return result,
                 Err(_would_block) => continue,
             }
