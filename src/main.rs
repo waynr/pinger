@@ -254,7 +254,7 @@ impl IcmpSocket {
         }
 
         Ok(Self {
-            sender: sender,
+            sender,
             receiver: AsyncFd::new(receiver)?,
             buf,
             icmp_timeout,
