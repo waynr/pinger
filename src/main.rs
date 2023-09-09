@@ -35,11 +35,7 @@ const ICMP_REQUEST_PACKET_SIZE: usize = ETHERNET_PACKET_MIN_SIZE
     + MutableEchoRequestPacket::minimum_packet_size();
 const ICMP_REPLY_PACKET_SIZE: usize = EchoReplyPacket::minimum_packet_size();
 
-struct Pinger {
-    socket_rb: ArrayQueue<Box<IcmpSocket>>,
-}
-
-// A ring buffer of IcmpSockets that makes concurrent pings easy.
+// A ring buffer of IcmpProbes that makes concurrent pings easy.
 //
 // # Implementation Notes
 //
@@ -51,10 +47,10 @@ struct Pinger {
 // specified icmp timeout.
 //
 // One potential limitation here is going to be the number of concurrent pings that can run
-// since the number of `IcmpSocket` instances is limited using the ArrayQueue. One possibility
+// since the number of `IcmpProbe` instances is limited using the ArrayQueue. One possibility
 // to address this would be to use crossbeam's `SegQueue`[1] type which is an unbounded data
 // structure with similar semantics. In this case we wouldn't even need to initialize the queue
-// here, we could create new `IcmpSocket`s whenever `SeqQueue.pop` returns None, then push the
+// here, we could create new `IcmpProbe`s whenever `SeqQueue.pop` returns None, then push the
 // new socket onto the queue when its first usage is finished. This would allow the queue to
 // grow to its natural size for a given set of input parameters (count, interval) and network
 // characteristics (round trip latency).
@@ -64,13 +60,17 @@ struct Pinger {
 //
 // [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
 //
-impl Pinger {
+struct Prober {
+    socket_rb: ArrayQueue<Box<IcmpProbe>>,
+}
+
+impl Prober {
     fn new(ethernet_conf: EthernetConf, rb_size: usize, icmp_timeout: Duration) -> Result<Self> {
         let sender = Self::create_sender(&ethernet_conf)?;
-        let socket_rb: ArrayQueue<Box<IcmpSocket>> = ArrayQueue::new(rb_size);
+        let socket_rb: ArrayQueue<Box<IcmpProbe>> = ArrayQueue::new(rb_size);
         for _ in 0..rb_size {
             let receiver = Self::create_receiver()?;
-            let icmp_socket = Box::new(IcmpSocket::new(
+            let icmp_socket = Box::new(IcmpProbe::new(
                 sender.clone(),
                 receiver,
                 &ethernet_conf,
@@ -148,9 +148,9 @@ impl Pinger {
         Ok(AsyncSocket::new(socket)?)
     }
 
-    async fn ping(&self, addr: &SockAddr, seq: u16) {
-        let mut socket = loop {
-            log::trace!("try retrieving socket for packet {}", seq);
+    async fn probe(&self, addr: &SockAddr, seq: u16) {
+        let mut probe = loop {
+            log::trace!("try retrieving probe for packet {}", seq);
             match self.socket_rb.pop() {
                 Some(b) => break b,
                 None => {
@@ -159,15 +159,15 @@ impl Pinger {
             }
         };
 
-        socket.ping(addr, seq).await;
+        probe.ping(addr, seq).await;
 
         loop {
-            log::trace!("try pushing socket back onto queue");
-            match self.socket_rb.push(socket) {
+            log::trace!("try pushing probe back onto queue");
+            match self.socket_rb.push(probe) {
                 Ok(_) => break,
                 Err(b) => {
                     tokio::time::sleep(Duration::from_millis(1)).await;
-                    socket = b;
+                    probe = b;
                 }
             }
         }
@@ -239,14 +239,14 @@ impl AsyncSocket {
 ///
 /// [1] https://zmap.io/paper.pdf
 #[derive(Debug)]
-struct IcmpSocket {
+struct IcmpProbe {
     sender: AsyncSocket,
     receiver: AsyncSocket,
     icmp_timeout: Duration,
     buf: [u8; ICMP_REQUEST_PACKET_SIZE],
 }
 
-impl IcmpSocket {
+impl IcmpProbe {
     fn new(
         sender: AsyncSocket,
         receiver: AsyncSocket,
@@ -761,12 +761,12 @@ async fn main() -> Result<()> {
     let icmp_timeout = Duration::from_millis(cli.icmp_timeout);
 
     let queue_size = 100usize;
-    let pinger = Arc::new(Pinger::new(ethernet_conf, queue_size, icmp_timeout)?);
+    let prober = Arc::new(Prober::new(ethernet_conf, queue_size, icmp_timeout)?);
 
     let mut set = JoinSet::new();
 
     for target in targets.into_iter() {
-        let p = pinger.clone();
+        let p = prober.clone();
         set.spawn(async move {
             let mut set = JoinSet::new();
 
@@ -777,7 +777,7 @@ async fn main() -> Result<()> {
                 interval.tick().await;
                 let a = addr.clone();
                 let p = p.clone();
-                set.spawn(async move { p.ping(&a, i).await });
+                set.spawn(async move { p.probe(&a, i).await });
             }
 
             while set.join_next().await.is_some() {}
