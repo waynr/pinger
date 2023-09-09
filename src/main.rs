@@ -68,7 +68,7 @@ struct Pinger {
 //
 impl Pinger {
     fn new(ethernet_conf: EthernetConf, rb_size: usize, icmp_timeout: Duration) -> Result<Self> {
-        let sender = Arc::new(AsyncFd::new(Self::create_sender(&ethernet_conf)?)?);
+        let sender = Self::create_sender(&ethernet_conf)?;
         let socket_rb: ArrayQueue<Box<IcmpSocket>> = ArrayQueue::new(rb_size);
         for _ in 0..rb_size {
             let receiver = Self::create_receiver()?;
@@ -86,21 +86,21 @@ impl Pinger {
         Ok(Self { socket_rb })
     }
 
-    fn create_receiver() -> Result<Socket> {
+    fn create_receiver() -> Result<AsyncSocket> {
         // choose Domain::PACKET here so that we can cache ICMP reply packets and circumvent
         // network-layer handling of packets in the kernel
         //Some(Protocol::from(libc::ETH_P_ALL.to_be())),
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
+        let socket = Socket::new(Domain::PACKET, Type::DGRAM, Some(Protocol::ICMPV4))?;
 
         socket.set_nonblocking(true)?;
         let rw_timeout = Some(Duration::from_millis(1));
         socket.set_write_timeout(rw_timeout)?;
         socket.set_read_timeout(rw_timeout)?;
 
-        Ok(socket)
+        Ok(AsyncSocket::new(socket)?)
     }
 
-    fn create_sender(ethernet_conf: &EthernetConf) -> Result<Socket> {
+    fn create_sender(ethernet_conf: &EthernetConf) -> Result<AsyncSocket> {
         // choose Domain::PACKET here so that we can cache ICMP reply packets and circumvent
         // network-layer handling of packets in the kernel
         let socket = Socket::new(Domain::PACKET, Type::RAW, None)?;
@@ -147,7 +147,7 @@ impl Pinger {
         // above would fail with an EINVAL error for an AF_PACKET
         socket.bind(&addr)?;
 
-        Ok(socket)
+        Ok(AsyncSocket::new(socket)?)
     }
 
     async fn ping(&self, addr: &SockAddr, seq: u16) {
@@ -171,6 +171,47 @@ impl Pinger {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                     socket = b;
                 }
+            }
+        }
+    }
+}
+
+/// Clonable async socket wrapper with convenience methods for performing async send/recv
+/// operations.
+#[derive(Clone, Debug)]
+struct AsyncSocket {
+    inner: Arc<AsyncFd<Socket>>,
+}
+
+impl AsyncSocket {
+    fn new(s: Socket) -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(AsyncFd::new(s)?),
+        })
+    }
+
+    /// Populate given MaybeUninit buffer asynchronously.
+    async fn recv(&self, buf: &mut [MaybeUninit<u8>]) -> std::io::Result<usize> {
+        loop {
+            log::trace!("waiting for receiver to be readable");
+            let mut guard = self.inner.readable().await?;
+            log::trace!("receiver is readable");
+
+            match guard.try_io(|receiver| receiver.get_ref().recv(buf)) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    /// Send referenced buffer asynchronously.
+    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            let mut guard = self.inner.writable().await?;
+
+            match guard.try_io(|sender| sender.get_ref().send(buf)) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
             }
         }
     }
@@ -201,16 +242,16 @@ impl Pinger {
 /// [1] https://zmap.io/paper.pdf
 #[derive(Debug)]
 struct IcmpSocket {
-    sender: Arc<AsyncFd<Socket>>,
-    receiver: AsyncFd<Socket>,
+    sender: AsyncSocket,
+    receiver: AsyncSocket,
     icmp_timeout: Duration,
     buf: [u8; ICMP_REQUEST_PACKET_SIZE],
 }
 
 impl IcmpSocket {
     fn new(
-        sender: Arc<AsyncFd<Socket>>,
-        receiver: Socket,
+        sender: AsyncSocket,
+        receiver: AsyncSocket,
         ethernet_conf: &EthernetConf,
         icmp_timeout: Duration,
     ) -> Result<Self> {
@@ -261,32 +302,10 @@ impl IcmpSocket {
 
         Ok(Self {
             sender,
-            receiver: AsyncFd::new(receiver)?,
+            receiver,
             buf,
             icmp_timeout,
         })
-    }
-
-    async fn recv(&self, out: &mut [MaybeUninit<u8>]) -> std::io::Result<usize> {
-        loop {
-            let mut guard = self.receiver.readable().await?;
-
-            match guard.try_io(|receiver| receiver.get_ref().recv(out)) {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
-            }
-        }
-    }
-
-    async fn send(&self) -> std::io::Result<usize> {
-        loop {
-            let mut guard = self.sender.writable().await?;
-
-            match guard.try_io(|sender| sender.get_ref().send(&self.buf)) {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
-            }
-        }
     }
 
     /// Updates the icmp buffer with the current icmp sequence and the new icmp checksum.
@@ -316,7 +335,8 @@ impl IcmpSocket {
     async fn ping(&mut self, addr: &SockAddr, seq: u16) {
         let ip = addr.as_socket_ipv4().unwrap().ip().clone();
         self.update_icmp_request_packet(&ip, seq);
-        let recv_echo_reply_fut = self.recv_echo_reply(addr, seq);
+        let receiver = self.receiver.clone();
+        let recv_echo_reply_fut = tokio::spawn(Self::recv_echo_reply(receiver, ip.clone(), seq));
         self.send_echo_request(seq).await;
 
         let start = Instant::now();
@@ -332,7 +352,7 @@ impl IcmpSocket {
 
     async fn send_echo_request(&self, seq: u16) {
         log::trace!("about to try sending via async io");
-        match self.send().await {
+        match self.sender.send(&self.buf).await {
             Err(e) => {
                 panic!("unhandled socket send error: {}", e);
             }
@@ -342,7 +362,7 @@ impl IcmpSocket {
         }
     }
 
-    async fn recv_echo_reply(&self, addr: &SockAddr, seq: u16) {
+    async fn recv_echo_reply(receiver: AsyncSocket, ipv4addr: Ipv4Addr, seq: u16) {
         // "works", but nothing gets written
         //let mut reply_buf: Vec<MaybeUninit<u8>> = Vec::new();
         //let mut reply_slice = reply_buf.as_mut_slice();
@@ -356,14 +376,9 @@ impl IcmpSocket {
         // note: we create a bigger array than ICMP_REPLY_PACKET_SIZE because it's possible we get
         // something other than an ICMP reply from the remote and we should try to be aware when
         // that's happening
-        let ipv4addr = addr
-            .as_socket_ipv4()
-            .expect("we only support ipv4 for now")
-            .ip()
-            .clone();
         loop {
             let mut reply_slice = [MaybeUninit::<u8>::uninit(); ICMP_REPLY_PACKET_SIZE + 100];
-            match self.recv(&mut reply_slice).await {
+            match receiver.recv(&mut reply_slice).await {
                 Err(e) => {
                     panic!("unhandled socket read error: {}", e);
                 }
