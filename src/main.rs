@@ -321,7 +321,6 @@ impl IcmpSocket {
 
         let start = Instant::now();
         let icmp_timeout = self.icmp_timeout.clone();
-        let ip = addr.as_socket_ipv4().unwrap().ip().clone();
         match timeout(icmp_timeout, recv_echo_reply_fut).await {
             Err(_elapsed) => println!("{},{},TIMEDOUT", ip, seq),
             Ok(_) => {
@@ -332,16 +331,13 @@ impl IcmpSocket {
     }
 
     async fn send_echo_request(&self, seq: u16) {
-        loop {
-            log::trace!("about to try sending via async io");
-            match self.send().await {
-                Err(e) => {
-                    panic!("unhandled socket send error: {}", e);
-                }
-                Ok(length) => {
-                    log::trace!("sent {} bytes for request {}", length, seq);
-                    break;
-                }
+        log::trace!("about to try sending via async io");
+        match self.send().await {
+            Err(e) => {
+                panic!("unhandled socket send error: {}", e);
+            }
+            Ok(length) => {
+                log::trace!("sent {} bytes for request {}", length, seq);
             }
         }
     }
