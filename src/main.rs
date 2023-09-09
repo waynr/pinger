@@ -1,4 +1,5 @@
 use crossbeam::queue::ArrayQueue;
+use pnet::packet::icmp::MutableIcmpPacket;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
@@ -12,12 +13,12 @@ use futures::stream::TryStreamExt;
 use netlink_packet_route::rtnl::{address, constants as nlconsts, link, neighbour};
 use netlink_packet_route::LinkMessage;
 use pnet::packet::{
-    ethernet::{EtherTypes, Ethernet, MutableEthernetPacket},
+    ethernet::{EtherTypes, Ethernet, EthernetPacket, MutableEthernetPacket},
     icmp::echo_reply::EchoReplyPacket,
     icmp::{echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket, IcmpTypes},
     ip::IpNextHeaderProtocols,
-    ipv4::Ipv4Packet,
-    Packet,
+    ipv4::{Ipv4Packet, MutableIpv4Packet},
+    MutablePacket, Packet,
 };
 use pnet::util::MacAddr;
 use rtnetlink::{new_connection, Handle, IpVersion};
@@ -27,9 +28,14 @@ use tokio::io::unix::AsyncFd;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-const ICMP_REQUEST_PACKET_SIZE: usize = MutableEchoRequestPacket::minimum_packet_size();
-const ICMP_REPLY_PACKET_SIZE: usize =
-    Ipv4Packet::minimum_packet_size() + EchoReplyPacket::minimum_packet_size();
+const ETHERNET_PACKET_MIN_SIZE: usize = MutableEthernetPacket::minimum_packet_size();
+const IPV4_PACKET_MIN_SIZE: usize = Ipv4Packet::minimum_packet_size();
+const ICMP_REQUEST_PACKET_SIZE: usize = ETHERNET_PACKET_MIN_SIZE
+    + IPV4_PACKET_MIN_SIZE
+    + MutableEchoRequestPacket::minimum_packet_size();
+const ICMP_REPLY_PACKET_SIZE: usize = ETHERNET_PACKET_MIN_SIZE
+    + Ipv4Packet::minimum_packet_size()
+    + EchoReplyPacket::minimum_packet_size();
 
 struct Pinger {
     socket_rb: ArrayQueue<Box<IcmpSocket>>,
@@ -133,7 +139,11 @@ impl IcmpSocket {
     fn new(ethernet_conf: &EthernetConf, icmp_timeout: Duration) -> Result<Self> {
         // choose Domain::PACKET here so that we can cache ICMP reply packets and circumvent
         // network-layer handling of packets in the kernel
-        let inner = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::ICMPV4))?;
+        let inner = Socket::new(
+            Domain::PACKET,
+            Type::RAW,
+            Some(Protocol::from(libc::ETH_P_ALL.to_be())),
+        )?;
 
         // initialize sockaddr_storage then reference as raw pointer to a sockaddr_ll in order to
         // set link-layer options on the addr before binding the socket. the intent here is to bind
@@ -151,10 +161,13 @@ impl IcmpSocket {
             // to be at least as large as any other sockaddr_* libc type and cast to any of those
             // types (such as sockaddr_ll here) so that the needed fields for the sockaddr_* type
             // can be set
+            //let hw = ethernet_conf.ethernet_info.source.clone();
+            //log::debug!("hw addr: {:?}", hw);
             unsafe {
                 (*addr_ll_ref).sll_family = libc::AF_PACKET as u16;
                 (*addr_ll_ref).sll_ifindex = ethernet_conf.interface.index as i32;
-                (*addr_ll_ref).sll_protocol = libc::IPPROTO_ICMP as u16;
+                (*addr_ll_ref).sll_protocol = libc::ETH_P_ALL as u16;
+                //(*addr_ll_ref).sll_addr = [hw.0, hw.1, hw.2, hw.3, hw.4, hw.5, 0, 0];
                 log::debug!("sockaddr_ll for bind set to: {:?}", *addr_ll_ref);
             }
         }
@@ -166,7 +179,7 @@ impl IcmpSocket {
         let addr = unsafe { SockAddr::new(addr_storage, len) };
 
         // trying to bind any other type of SockAddr (eg Ipv4Addr) than what we have initialized
-        // above would fail for an AF_PACKET with an EINVAL OS error.
+        // above would fail with an EINVAL error for an AF_PACKET
         inner.bind(&addr)?;
 
         inner.set_nonblocking(true)?;
@@ -176,7 +189,43 @@ impl IcmpSocket {
 
         let mut buf = [0u8; ICMP_REQUEST_PACKET_SIZE];
         {
-            let mut icmp_packet = MutableEchoRequestPacket::new(&mut buf)
+            let mut ethernet_packet = MutableEthernetPacket::new(&mut buf).expect("meow");
+            log::debug!("ethernet_packet len: {}", ethernet_packet.packet().len());
+            ethernet_packet.set_source(ethernet_conf.ethernet_info.source);
+            ethernet_packet.set_destination(ethernet_conf.ethernet_info.destination);
+            ethernet_packet.set_ethertype(ethernet_conf.ethernet_info.ethertype);
+
+            log::debug!(
+                "ethernet_packet payload len: {}",
+                ethernet_packet.payload().len()
+            );
+            let mut ipv4_packet =
+                MutableIpv4Packet::new(ethernet_packet.payload_mut()).expect("meow");
+            log::debug!("ipv4_packetlen: {}", ipv4_packet.packet().len());
+            ipv4_packet.set_version(4);
+            ipv4_packet.set_source(ethernet_conf.interface.address);
+            ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Icmp);
+            ipv4_packet.set_header_length(5);
+            ipv4_packet.set_ttl(101); // not sure what a good value here would be so i picked this
+            ipv4_packet.set_checksum(0); // not sure what a good value here would be so i picked this
+            ipv4_packet.set_total_length(
+                (MutableIpv4Packet::minimum_packet_size()
+                    + MutableEchoRequestPacket::minimum_packet_size()) as u16,
+            );
+            // arbitrarily
+            let checksum = pnet::packet::ipv4::checksum(
+                &Ipv4Packet::new(ipv4_packet.packet()).expect("the buf size should be fine"),
+            );
+            ipv4_packet.set_checksum(checksum);
+
+            log::debug!("ipv4 len: {}", MutableIpv4Packet::minimum_packet_size());
+            log::debug!(
+                "icmp min len: {}",
+                MutableEchoRequestPacket::minimum_packet_size()
+            );
+            log::debug!("ipv4_packet total len: {}", ipv4_packet.get_total_length());
+            log::debug!("ipv4_packet payload len: {}", ipv4_packet.payload().len());
+            let mut icmp_packet = MutableEchoRequestPacket::new(ipv4_packet.payload_mut())
                 .expect("the buf size should be exactly the minimum icmp packet size");
             icmp_packet.set_icmp_type(IcmpTypes::EchoRequest);
             icmp_packet.set_icmp_code(IcmpCode(0));
@@ -213,10 +262,21 @@ impl IcmpSocket {
     }
 
     /// Updates the icmp buffer with the current icmp sequence and the new icmp checksum.
-    fn update_icmp_request_packet(&mut self, seq: u16) {
-        let mut icmp_packet = MutableEchoRequestPacket::new(&mut self.buf)
+    fn update_icmp_request_packet(&mut self, addr: &Ipv4Addr, seq: u16) {
+        let mut ethernet_packet = MutableEthernetPacket::new(&mut self.buf).expect("meow");
+
+        let mut ipv4_packet = MutableIpv4Packet::new(ethernet_packet.payload_mut()).expect("meow");
+        ipv4_packet.set_destination(addr.clone());
+        ipv4_packet.set_checksum(0);
+        let checksum = pnet::packet::ipv4::checksum(
+            &Ipv4Packet::new(ipv4_packet.packet()).expect("the buf size should be fine"),
+        );
+        ipv4_packet.set_checksum(checksum);
+
+        let mut icmp_packet = MutableEchoRequestPacket::new(ipv4_packet.payload_mut())
             .expect("the buf size should be exactly the minimum icmp packet size");
         icmp_packet.set_sequence_number(seq);
+        icmp_packet.set_checksum(0);
 
         let checksum = pnet::packet::icmp::checksum(
             &IcmpPacket::new(icmp_packet.packet())
@@ -226,7 +286,8 @@ impl IcmpSocket {
     }
 
     async fn ping(&mut self, addr: &SockAddr, seq: u16) {
-        self.update_icmp_request_packet(seq);
+        let ip = addr.as_socket_ipv4().unwrap().ip().clone();
+        self.update_icmp_request_packet(&ip, seq);
         self.send_echo_request(addr, seq).await;
 
         let start = Instant::now();
@@ -326,11 +387,15 @@ impl IcmpSocket {
 }
 
 /// Check that the given buffer is:
+/// * from the expected link local addr
 /// * from the expected source IP
 /// * the right kind of IP packet (ICMP)
 /// * the right kind of ICMP packet (Echo Reply)
 /// * the expected sequence number
 fn is_expected_packet(reply_buf: &[u8], addr: &Ipv4Addr, seq: u16) -> bool {
+    // check that it's an Ethernet packet
+    let ethernet_packet = EthernetPacket::new(&reply_buf)
+        .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
     // check that it's an ICMP packet
     let ipv4_header_len = {
         let ipv4_packet = Ipv4Packet::new(&reply_buf)
@@ -374,12 +439,13 @@ fn is_expected_packet(reply_buf: &[u8], addr: &Ipv4Addr, seq: u16) -> bool {
     reply_packet.get_sequence_number() == seq
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 /// Information about the interface on which we will emit packets and listen for responses.
 struct InterfaceInfo {
     name: String,
     index: u32,
-    address: [u8; 4],
+    //address: [u8; 4],
+    address: Ipv4Addr,
     mac_addr: MacAddr,
 }
 
@@ -416,7 +482,7 @@ impl TryFrom<LinkMessage> for InterfaceInfo {
         Ok(InterfaceInfo {
             name,
             index,
-            address: [0u8, 0, 0, 0],
+            address: Ipv4Addr::new(0u8, 0, 0, 0),
             mac_addr,
         })
     }
@@ -445,7 +511,7 @@ impl InterfaceInfo {
                 .iter()
                 .find_map(|nla| match nla {
                     address::nlas::Nla::Address(v) if v.len() == 4 => {
-                        Some([v[0], v[1], v[2], v[3]])
+                        Some(Ipv4Addr::new(v[0], v[1], v[2], v[3]))
                     }
                     _ => None,
                 })
