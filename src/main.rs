@@ -33,9 +33,7 @@ const IPV4_PACKET_MIN_SIZE: usize = Ipv4Packet::minimum_packet_size();
 const ICMP_REQUEST_PACKET_SIZE: usize = ETHERNET_PACKET_MIN_SIZE
     + IPV4_PACKET_MIN_SIZE
     + MutableEchoRequestPacket::minimum_packet_size();
-const ICMP_REPLY_PACKET_SIZE: usize = ETHERNET_PACKET_MIN_SIZE
-    + Ipv4Packet::minimum_packet_size()
-    + EchoReplyPacket::minimum_packet_size();
+const ICMP_REPLY_PACKET_SIZE: usize = EchoReplyPacket::minimum_packet_size();
 
 struct Pinger {
     socket_rb: ArrayQueue<Box<IcmpSocket>>,
@@ -87,10 +85,10 @@ impl Pinger {
     }
 
     fn create_receiver() -> Result<AsyncSocket> {
-        // choose Domain::PACKET here so that we can cache ICMP reply packets and circumvent
-        // network-layer handling of packets in the kernel
-        //Some(Protocol::from(libc::ETH_P_ALL.to_be())),
-        let socket = Socket::new(Domain::PACKET, Type::DGRAM, Some(Protocol::ICMPV4))?;
+        // note: for some reason using Domain::PACKET as is done in zmap (libpcap, really) doesn't
+        // work here -- the socket never becomes ready for reading. for now I'm setting it back to
+        // Domain::IPV4 but will continue trying to figure out how to get Domain::PACKET working
+        let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
 
         socket.set_nonblocking(true)?;
         let rw_timeout = Some(Duration::from_millis(1));
@@ -427,15 +425,11 @@ impl IcmpSocket {
 }
 
 /// Check that the given buffer is:
-/// * from the expected link local addr
 /// * from the expected source IP
 /// * the right kind of IP packet (ICMP)
 /// * the right kind of ICMP packet (Echo Reply)
 /// * the expected sequence number
 fn is_expected_packet(reply_buf: &[u8], addr: &Ipv4Addr, seq: u16) -> bool {
-    // check that it's an Ethernet packet
-    let ethernet_packet = EthernetPacket::new(&reply_buf)
-        .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
     // check that it's an ICMP packet
     let ipv4_header_len = {
         let ipv4_packet = Ipv4Packet::new(&reply_buf)
