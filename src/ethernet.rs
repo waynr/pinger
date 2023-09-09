@@ -9,8 +9,8 @@ use rtnetlink::{new_connection, Handle, IpVersion};
 
 use crate::error::Result;
 
-#[derive(Debug)]
 /// Information about the interface on which we will emit packets and listen for responses.
+#[derive(Debug)]
 pub struct InterfaceInfo {
     name: String,
     pub index: u32,
