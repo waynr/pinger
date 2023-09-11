@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
     let icmp_timeout = Duration::from_millis(cli.icmp_timeout);
 
     let probe_count = 100usize;
-    let probes = IcmpProbe::many(probe_count)?;
+    let probes = IcmpProbe::many(probe_count, &ethernet_conf)?;
     let prober = Arc::new(Prober::new(probes, ethernet_conf, icmp_timeout)?);
 
     let mut set = JoinSet::new();

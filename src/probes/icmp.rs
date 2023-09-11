@@ -49,9 +49,17 @@ pub struct IcmpProbe {
     buf: [u8; ICMP_REQUEST_PACKET_SIZE],
 }
 
+// TODO: make these actually Send/Sync
+unsafe impl Send for IcmpProbe {}
+unsafe impl Sync for IcmpProbe {}
+
 impl IcmpProbe {
-    pub fn many(count: usize) -> Result<Vec<Self>> {
-        Ok(Vec::new())
+    pub fn many(count: usize, ethernet_conf: &EthernetConf) -> Result<Vec<Self>> {
+        let mut v = Vec::new();
+        for _ in 0..count {
+            v.push(Self::new(ethernet_conf)?);
+        }
+        Ok(v)
     }
 
     pub fn new(

@@ -48,12 +48,8 @@ pub trait Probe {
     //fn recv(&mut self, socket: AsyncSocket) -> Result<Self::Output>;
 }
 
-/// A convenience trait to simplify type definitions that are generic over `Probe` and which are used
-/// in contexts which have additional type bounds such as Debug.
-pub trait ProbeAnd: Probe + Send + Sync + 'static + std::fmt::Debug {}
-
 #[derive(Debug)]
-struct ProbeTask<P: ProbeAnd> {
+struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
     probe: Arc<Mutex<P>>,
     sender: AsyncSocket,
     // TODO: there is a risk if a `ProbeTask` is idle for too long that the socket's kernel-side
@@ -70,9 +66,9 @@ struct ProbeTask<P: ProbeAnd> {
     timeout: Duration,
 }
 
-impl<P: ProbeAnd> ProbeTask<P> {
+impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
     /// Asynchronously run probe task end-to-end, including wait for reply.
-    async fn probe(&mut self, tparams: TargetParams) -> Result<P::Output> {
+    async fn probe(&mut self, tparams: TargetParams) -> Option<P::Output> {
         self.probe.lock().await.update_buffer(&tparams);
 
         let wait_for_reply_fut = {
@@ -88,7 +84,8 @@ impl<P: ProbeAnd> ProbeTask<P> {
         let output = match timeout(self.timeout.clone(), wait_for_reply_fut).await {
             Err(_elapsed) => {
                 println!("{},{},TIMEDOUT", tparams.addr, tparams.seq);
-                return Err(format!("timed out waiting for {} probe reply", tparams).into());
+                //return Err(format!("timed out waiting for {} probe reply", tparams).into());
+                return None
             }
             Ok(o) => {
                 let elapsed = start.elapsed();
@@ -96,7 +93,7 @@ impl<P: ProbeAnd> ProbeTask<P> {
                 o
             }
         };
-        Ok(output?)
+        Some(output.ok()?)
     }
 
     /// Send the Probe's ethernet packet on the sender AsyncSocket.
@@ -145,11 +142,11 @@ impl<P: ProbeAnd> ProbeTask<P> {
 }
 
 // Generic framework for asynchronously conducting network scans.
-pub struct Prober<P: ProbeAnd> {
+pub struct Prober<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
     queue: ArrayQueue<Box<ProbeTask<P>>>,
 }
 
-impl<P: ProbeAnd> Prober<P> {
+impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
     pub fn new(probes: Vec<P>, ethernet_conf: EthernetConf, timeout: Duration) -> Result<Self> {
         let sender = IcmpProber::create_sender(&ethernet_conf)?;
 
@@ -170,7 +167,7 @@ impl<P: ProbeAnd> Prober<P> {
     }
 
     // Execute async task to probe the given target.
-    pub async fn probe(&self, tparams: TargetParams) -> Result<P::Output> {
+    pub async fn probe(&self, tparams: TargetParams) -> Option<P::Output> {
         let mut task = loop {
             log::trace!("try retrieving probe task {}", tparams);
             match self.queue.pop() {
@@ -193,7 +190,7 @@ impl<P: ProbeAnd> Prober<P> {
                 }
             }
         }
-        Ok(output)
+        Some(output)
     }
 }
 
