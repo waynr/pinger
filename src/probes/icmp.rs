@@ -126,9 +126,7 @@ impl Probe for IcmpProbe {
 
     async fn send(&mut self, socket: AsyncSocket, tparams: &TargetParams) -> Result<()> {
         self.update_icmp_request_packet(&tparams.addr, tparams.seq).await;
-        let buf = self.buf.lock().await;
-        let slice = buf.as_slice();
-        match socket.send(slice).await {
+        match socket.send(self.buf.lock().await.as_slice()).await {
             Err(e) => {
                 panic!("unhandled socket send error: {}", e);
             }
