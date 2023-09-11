@@ -79,26 +79,20 @@ struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
 impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
     /// Asynchronously run probe task end-to-end, including wait for reply.
     async fn probe(&mut self, tparams: TargetParams) -> Result<P::Output> {
-        // begin waiting for reply before sending request to avoid potential race between request
-        // send and reply wait. in retrospect, this shouldn't actually be a problem since while the
-        // receiver socket is idle the kernel is probably filling a buffer with packets that only
-        // get filtered when the following task is running.
-        //
-        // however, once we refactor to use a single global receiver socket per probe type with
-        // socket listening on its own dedicated thread and begin using channels to wait for
-        // replies detected by the global listener we will very likely need to do this.
-        //
-        // let wait_for_reply_fut = {
-        //     let receiver = self.receiver.clone();
-        //     let tparams = tparams.clone();
-        //     let probe = self.probe.clone();
-        //     tokio::spawn(Self::wait_for_reply(probe, receiver, tparams))
-        // };
-
         self.probe
             .send(self.sender.clone(), &tparams)
             .await?;
 
+        // it's safe-ish to have a gap between sending the request and receiving the packet here
+        // because the receiver `AsyncSocket` is always listening for packets and the underlying
+        // kernel packet buffer for this socket _should_ be large enough for the current toy use
+        // case nature of this probing framework that we won't receive packets on it fast enough
+        // that the one we are looking for gets dropped before we have a chance to receive it.
+        //
+        // as mentioned in comments on the receiver itself, we eventually want to refactor to use a
+        // global receiving socket per `Prober` to enable high frequency scanning. this will likely
+        // mean we need to spawn a separate task to wait for the reply prior to sending the request
+        // to avoid races in low-latency scanning applications.
         let wait_for_reply_fut = self.wait_for_reply(&tparams);
 
         let start = Instant::now();
