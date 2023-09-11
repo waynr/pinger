@@ -27,14 +27,6 @@ impl std::fmt::Display for TargetParams {
     }
 }
 
-/// Possible network layers for a `Probe` to operate at. Used by generic probe code to properly set
-/// up sockets before beginning probe loop.
-pub enum NetworkLayer {
-    Ethernet,
-    Link,
-    Network,
-}
-
 // A probe managed by the Prober.
 pub trait Probe {
     // The output generated when the `Prober` successfully detects a response to the `Probe` for a
