@@ -1,11 +1,10 @@
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use csv::{ReaderBuilder, Terminator};
 use serde::Deserialize;
-use socket2::SockAddr;
 use tokio::task::JoinSet;
 
 mod error;
@@ -100,10 +99,8 @@ async fn main() -> Result<()> {
 
             let p = p.clone();
             let mut interval = tokio::time::interval(Duration::from_millis(target.interval));
-            let addr: Box<SockAddr> = Box::new(SocketAddrV4::new(target.addr, 0).into());
             for i in 0..target.count {
                 interval.tick().await;
-                let a = addr.clone();
                 let p = p.clone();
                 let tparams = TargetParams{
                     addr: target.addr,
