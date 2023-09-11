@@ -1,4 +1,6 @@
 use std::net::Ipv4Addr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use async_trait::async_trait;
 use pnet::packet::{
@@ -27,12 +29,8 @@ const ICMP_REPLY_PACKET_SIZE: usize = EchoReplyPacket::minimum_packet_size();
 /// Implementation of `Probe` trait to enable a `Prober` to conduct ICMP echo probes.
 #[derive(Debug)]
 pub struct IcmpProbe {
-    buf: [u8; ICMP_REQUEST_PACKET_SIZE],
+    buf: Arc<Mutex<[u8; ICMP_REQUEST_PACKET_SIZE]>>,
 }
-
-// TODO: make these actually Send/Sync
-unsafe impl Send for IcmpProbe {}
-unsafe impl Sync for IcmpProbe {}
 
 impl IcmpProbe {
     pub fn many(count: usize, ethernet_conf: &EthernetConf) -> Result<Vec<Self>> {
@@ -89,12 +87,14 @@ impl IcmpProbe {
             icmp_packet.set_identifier(42);
         }
 
-        Ok(Self { buf })
+        Ok(Self { buf: Arc::new(Mutex::new(buf)) })
     }
 
     /// Updates the icmp buffer with the current icmp sequence and the new icmp checksum.
-    fn update_icmp_request_packet(&mut self, addr: &Ipv4Addr, seq: u16) {
-        let mut ethernet_packet = MutableEthernetPacket::new(&mut self.buf).expect("meow");
+    async fn update_icmp_request_packet(&mut self, addr: &Ipv4Addr, seq: u16) {
+        let mut buf = self.buf.lock().await;
+        let slice = buf.as_mut_slice();
+        let mut ethernet_packet = MutableEthernetPacket::new(slice).expect("meow");
 
         let mut ipv4_packet = MutableIpv4Packet::new(ethernet_packet.payload_mut()).expect("meow");
         ipv4_packet.set_destination(addr.clone());
@@ -125,8 +125,10 @@ impl Probe for IcmpProbe {
     type Output = IcmpOutput;
 
     async fn send(&mut self, socket: AsyncSocket, tparams: &TargetParams) -> Result<()> {
-        self.update_icmp_request_packet(&tparams.addr, tparams.seq);
-        match socket.send(&self.buf).await {
+        self.update_icmp_request_packet(&tparams.addr, tparams.seq).await;
+        let buf = self.buf.lock().await;
+        let slice = buf.as_slice();
+        match socket.send(slice).await {
             Err(e) => {
                 panic!("unhandled socket send error: {}", e);
             }

@@ -1,12 +1,10 @@
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use crossbeam::queue::ArrayQueue;
 use serde::Serialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::error::Result;
@@ -62,7 +60,7 @@ pub trait Probe {
 /// [1] https://zmap.io/paper.pdf
 #[derive(Debug)]
 struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
-    probe: Arc<Mutex<P>>,
+    probe: P,
     sender: AsyncSocket,
     // TODO: there is a risk if a `ProbeTask` is idle for too long that the socket's kernel-side
     // receive buffer fills up with packets. this could lead to two problems: packet loss on the
@@ -85,18 +83,23 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
         // send and reply wait. in retrospect, this shouldn't actually be a problem since while the
         // receiver socket is idle the kernel is probably filling a buffer with packets that only
         // get filtered when the following task is running.
-        let wait_for_reply_fut = {
-            let receiver = self.receiver.clone();
-            let tparams = tparams.clone();
-            let probe = self.probe.clone();
-            tokio::spawn(Self::wait_for_reply(probe, receiver, tparams))
-        };
+        //
+        // however, once we refactor to use a single global receiver socket per probe type with
+        // socket listening on its own dedicated thread and begin using channels to wait for
+        // replies detected by the global listener we will very likely need to do this.
+        //
+        // let wait_for_reply_fut = {
+        //     let receiver = self.receiver.clone();
+        //     let tparams = tparams.clone();
+        //     let probe = self.probe.clone();
+        //     tokio::spawn(Self::wait_for_reply(probe, receiver, tparams))
+        // };
 
         self.probe
-            .lock()
-            .await
             .send(self.sender.clone(), &tparams)
             .await?;
+
+        let wait_for_reply_fut = self.wait_for_reply(&tparams);
 
         let start = Instant::now();
         let output = match timeout(self.timeout.clone(), wait_for_reply_fut).await {
@@ -110,19 +113,18 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
                 o
             }
         };
-        Ok(output?)
+        Ok(output)
     }
 
     /// Send the Probe's ethernet packet on the sender AsyncSocket.
     async fn wait_for_reply(
-        probe: Arc<Mutex<P>>,
-        receiver: AsyncSocket,
-        tparams: TargetParams,
+        &self,
+        tparams: &TargetParams,
     ) -> P::Output {
         loop {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
             let mut uninit = buf.spare_capacity_mut();
-            match receiver.recv(&mut uninit).await {
+            match self.receiver.recv(&mut uninit).await {
                 Err(e) => {
                     panic!("unhandled socket read error: {}", e);
                 }
@@ -133,7 +135,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
                         buf.set_len(len);
                     }
                     log::trace!("received {} bytes for reply {}", len, tparams);
-                    if let Some(output) = probe.lock().await.validate_response(&buf, &tparams) {
+                    if let Some(output) = self.probe.validate_response(&buf, &tparams) {
                         return output;
                     }
                 }
@@ -181,7 +183,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
         for probe in probes {
             let receiver = create_receiver()?;
             let probe_task = ProbeTask {
-                probe: Arc::new(Mutex::new(probe)),
+                probe,
                 sender: sender.clone(),
                 receiver,
                 timeout: timeout.clone(),
