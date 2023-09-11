@@ -1,4 +1,3 @@
-use std::mem::MaybeUninit;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +10,6 @@ use tokio::time::timeout;
 
 use crate::error::Result;
 use crate::ethernet::EthernetConf;
-use crate::probes::icmp::IcmpProbe;
 use crate::socket::AsyncSocket;
 
 /// Parametes describing a single `Probe` target.
@@ -224,34 +222,9 @@ impl<P: ProbeAnd> Prober<P> {
 //
 // [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
 //
-pub struct IcmpProber {
-    socket_rb: ArrayQueue<Box<IcmpProbe>>,
-}
+struct IcmpProber { }
 
 impl IcmpProber {
-    pub fn new(
-        ethernet_conf: EthernetConf,
-        rb_size: usize,
-        icmp_timeout: Duration,
-    ) -> Result<Self> {
-        let sender = Self::create_sender(&ethernet_conf)?;
-        let socket_rb: ArrayQueue<Box<IcmpProbe>> = ArrayQueue::new(rb_size);
-        for _ in 0..rb_size {
-            let receiver = Self::create_receiver()?;
-            let icmp_socket = Box::new(IcmpProbe::new(
-                sender.clone(),
-                receiver,
-                &ethernet_conf,
-                icmp_timeout.clone(),
-            )?);
-            socket_rb
-                .push(icmp_socket)
-                .expect("don't push more than the queues capacity");
-        }
-
-        Ok(Self { socket_rb })
-    }
-
     fn create_receiver() -> Result<AsyncSocket> {
         // note: for some reason using Domain::PACKET as is done in zmap (libpcap, really) doesn't
         // work here -- the socket never becomes ready for reading. for now I'm setting it back to
@@ -314,30 +287,5 @@ impl IcmpProber {
         socket.bind(&addr)?;
 
         Ok(AsyncSocket::new(socket)?)
-    }
-
-    pub async fn probe(&self, addr: &SockAddr, seq: u16) {
-        let mut probe = loop {
-            log::trace!("try retrieving probe for packet {}", seq);
-            match self.socket_rb.pop() {
-                Some(b) => break b,
-                None => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            }
-        };
-
-        probe.ping(addr, seq).await;
-
-        loop {
-            log::trace!("try pushing probe back onto queue");
-            match self.socket_rb.push(probe) {
-                Ok(_) => break,
-                Err(b) => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    probe = b;
-                }
-            }
-        }
     }
 }

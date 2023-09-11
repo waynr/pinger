@@ -16,7 +16,8 @@ mod socket;
 
 use error::Result;
 use ethernet::EthernetConf;
-use prober::IcmpProber;
+use probes::icmp::IcmpProbe;
+use prober::{Prober, TargetParams};
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -86,8 +87,9 @@ async fn main() -> Result<()> {
 
     let icmp_timeout = Duration::from_millis(cli.icmp_timeout);
 
-    let queue_size = 100usize;
-    let prober = Arc::new(IcmpProber::new(ethernet_conf, queue_size, icmp_timeout)?);
+    let probe_count = 100usize;
+    let probes = IcmpProbe::many(probe_count)?;
+    let prober = Arc::new(Prober::new(probes, ethernet_conf, icmp_timeout)?);
 
     let mut set = JoinSet::new();
 
@@ -103,7 +105,11 @@ async fn main() -> Result<()> {
                 interval.tick().await;
                 let a = addr.clone();
                 let p = p.clone();
-                set.spawn(async move { p.probe(&a, i).await });
+                let tparams = TargetParams{
+                    addr: target.addr,
+                    seq: i,
+                };
+                set.spawn(async move { p.probe(tparams).await });
             }
 
             while set.join_next().await.is_some() {}
