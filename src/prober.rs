@@ -6,6 +6,7 @@ use crossbeam::queue::ArrayQueue;
 use serde::Serialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::time::timeout;
+use tokio::sync::Mutex;
 
 use crate::error::Result;
 use crate::ethernet::EthernetConf;
@@ -41,7 +42,7 @@ pub trait Probe {
 
     /// Packet buffers are owned by probe module types, so in order to update a particular module
     /// instance before we send a request we need to tell it about the next target.
-    fn update_buffer(&self, params: &TargetParams) -> Result<()>;
+    fn update_buffer(&mut self, params: &TargetParams) -> Result<()>;
 
     /// Packet buffers are owned by probe module types; in order to send a request, we need a
     /// reference to the type's buffer.
@@ -63,7 +64,7 @@ pub trait ProbeAnd: Probe + Send + Sync + 'static + std::fmt::Debug {}
 
 #[derive(Debug)]
 struct ProbeTask<P: ProbeAnd> {
-    probe: Arc<P>,
+    probe: Arc<Mutex<P>>,
     sender: AsyncSocket,
     // TODO: there is a risk if a `ProbeTask` is idle for too long that the socket's kernel-side
     // receive buffer fills up with packets. this could lead to two problems: packet loss on the
@@ -81,9 +82,9 @@ struct ProbeTask<P: ProbeAnd> {
 
 impl<P: ProbeAnd> ProbeTask<P> {
     /// Asynchronously run probe task end-to-end, including wait for reply.
-    async fn probe(&self, tparams: TargetParams) -> Result<P::Output> {
+    async fn probe(&mut self, tparams: TargetParams) -> Result<P::Output> {
         let ip = tparams.addr.as_socket_ipv4().unwrap().ip().clone();
-        self.probe.update_buffer(&tparams);
+        self.probe.lock().await.update_buffer(&tparams);
 
         let wait_for_reply_fut = {
             let receiver = self.receiver.clone();
@@ -112,7 +113,8 @@ impl<P: ProbeAnd> ProbeTask<P> {
     /// Send the Probe's ethernet packet on the sender AsyncSocket.
     async fn send(&self, tparams: &TargetParams) -> Result<()> {
         log::trace!("about to try sending via async io");
-        let buf = self.probe.get_buffer();
+        let guard = self.probe.lock().await;
+        let buf = guard.get_buffer();
         match self.sender.send(buf).await {
             Err(e) => {
                 panic!("unhandled socket send error: {}", e);
@@ -125,7 +127,7 @@ impl<P: ProbeAnd> ProbeTask<P> {
     }
 
     /// Send the Probe's ethernet packet on the sender AsyncSocket.
-    async fn wait_for_reply(probe: Arc<P>, receiver: AsyncSocket, tparams: TargetParams) -> P::Output {
+    async fn wait_for_reply(probe: Arc<Mutex<P>>, receiver: AsyncSocket, tparams: TargetParams) -> P::Output {
         loop {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
             let mut uninit = buf.spare_capacity_mut();
@@ -140,7 +142,7 @@ impl<P: ProbeAnd> ProbeTask<P> {
                         buf.set_len(len);
                     }
                     log::trace!("received {} bytes for reply {}", len, tparams);
-                    if let Some(output) = probe.validate_response(&buf, &tparams) {
+                    if let Some(output) = probe.lock().await.validate_response(&buf, &tparams) {
                         return output
                     }
                 },
@@ -162,7 +164,7 @@ impl<P: ProbeAnd> Prober<P> {
         for probe in probes {
             let receiver = IcmpProber::create_receiver()?;
             let probe_task = ProbeTask {
-                probe: Arc::new(probe),
+                probe: Arc::new(Mutex::new(probe)),
                 sender: sender.clone(),
                 receiver,
                 timeout: timeout.clone(),
