@@ -68,8 +68,8 @@ struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
 
 impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
     /// Asynchronously run probe task end-to-end, including wait for reply.
-    async fn probe(&mut self, tparams: TargetParams) -> Option<P::Output> {
-        self.probe.lock().await.update_buffer(&tparams);
+    async fn probe(&mut self, tparams: TargetParams) -> Result<P::Output> {
+        self.probe.lock().await.update_buffer(&tparams)?;
 
         let wait_for_reply_fut = {
             let receiver = self.receiver.clone();
@@ -78,14 +78,13 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
             tokio::spawn(Self::wait_for_reply(probe, receiver, tparams))
         };
 
-        self.send(&tparams).await;
+        self.send(&tparams).await?;
 
         let start = Instant::now();
         let output = match timeout(self.timeout.clone(), wait_for_reply_fut).await {
             Err(_elapsed) => {
                 println!("{},{},TIMEDOUT", tparams.addr, tparams.seq);
-                //return Err(format!("timed out waiting for {} probe reply", tparams).into());
-                return None
+                return Err(format!("timed out waiting for {} probe reply", tparams).into());
             }
             Ok(o) => {
                 let elapsed = start.elapsed();
@@ -93,7 +92,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
                 o
             }
         };
-        Some(output.ok()?)
+        Ok(output?)
     }
 
     /// Send the Probe's ethernet packet on the sender AsyncSocket.
@@ -178,7 +177,13 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
             }
         };
 
-        let output = task.probe(tparams).await?;
+        let output = match task.probe(tparams.clone()).await {
+            Ok(o) => Some(o),
+            Err(e) => {
+                eprintln!("{} failed: {:?}", tparams, e);
+                None
+            },
+        };
 
         loop {
             log::trace!("try pushing task back onto queue");
@@ -190,7 +195,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
                 }
             }
         }
-        Some(output)
+        None
     }
 }
 

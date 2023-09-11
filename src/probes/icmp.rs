@@ -19,6 +19,7 @@ const IPV4_PACKET_MIN_SIZE: usize = Ipv4Packet::minimum_packet_size();
 const ICMP_REQUEST_PACKET_SIZE: usize = ETHERNET_PACKET_MIN_SIZE
     + IPV4_PACKET_MIN_SIZE
     + MutableEchoRequestPacket::minimum_packet_size();
+//TODO: check reply packet size in validation method
 const ICMP_REPLY_PACKET_SIZE: usize = EchoReplyPacket::minimum_packet_size();
 
 /// Abstraction for containing individual socket instances and pre-allocated Ethernet packet
