@@ -1,12 +1,206 @@
+use std::time::{Duration, Instant};
+use std::mem::MaybeUninit;
+use std::sync::Arc;
+
 use crossbeam::queue::ArrayQueue;
-use std::time::Duration;
-
+use serde::Serialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use tokio::time::timeout;
 
-use crate::probes::icmp::IcmpProbe;
 use crate::error::Result;
-use crate::socket::AsyncSocket;
 use crate::ethernet::EthernetConf;
+use crate::probes::icmp::IcmpProbe;
+use crate::socket::AsyncSocket;
+
+/// Parametes describing a single `Probe` target.
+#[derive(Clone)]
+pub struct TargetParams {
+    addr: SockAddr,
+    seq: u16,
+}
+
+impl std::fmt::Display for TargetParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?} ({})", self.addr, self.seq)
+    }
+}
+
+/// Possible network layers for a `Probe` to operate at. Used by generic probe code to properly set
+/// up sockets before beginning probe loop.
+pub enum NetworkLayer {
+    Ethernet,
+    Link,
+    Network,
+}
+
+// A probe managed by the Prober.
+pub trait Probe {
+    // The output generated when the `Prober` successfully detects a response to the `Probe` for a
+    // given `TargetParams`.
+    type Output: Send + Serialize;
+
+    /// Packet buffers are owned by probe module types, so in order to update a particular module
+    /// instance before we send a request we need to tell it about the next target.
+    fn update_buffer(&self, params: &TargetParams) -> Result<()>;
+
+    /// Packet buffers are owned by probe module types; in order to send a request, we need a
+    /// reference to the type's buffer.
+    fn get_buffer(&self) -> &[u8];
+
+    /// Return true if the given buffer matches the expectation for the given target parameters.
+    // TODO: might be more efficient to use pcap or something else to filter packets
+    fn validate_response(&self, buf: &[u8], params: &TargetParams) -> Option<Self::Output>;
+
+
+    // TODO: should probes themselves be responsible for sending and receiving/filtering packets?
+    //fn send(&mut self, socket: AsyncSocket, seq: u16) -> Result<()>;
+    //fn recv(&mut self, socket: AsyncSocket) -> Result<Self::Output>;
+}
+
+/// A convenience trait to simplify type definitions that are generic over `Probe` and which are used
+/// in contexts which have additional type bounds such as Debug.
+pub trait ProbeAnd: Probe + Send + Sync + 'static + std::fmt::Debug {}
+
+#[derive(Debug)]
+struct ProbeTask<P: ProbeAnd> {
+    probe: Arc<P>,
+    sender: AsyncSocket,
+    // TODO: there is a risk if a `ProbeTask` is idle for too long that the socket's kernel-side
+    // receive buffer fills up with packets. this could lead to two problems: packet loss on the
+    // kernel side and unnecessary cpu usage on the user side when draining the receiver. 
+    //
+    // in the long term it's probably better to have one single receiving socket "owned" by the
+    // `Prober` which distributes matching `Probe::Output` via oneshot channels to `ProbeTasks`
+    // that registry filter closures when they begin listening for their specific packet
+    //
+    // in the short term (while convering `IcmpProbe` to this generic `Prober` framework) it's
+    // probably fine to leave this as-is.
+    receiver: AsyncSocket,
+    timeout: Duration,
+}
+
+impl<P: ProbeAnd> ProbeTask<P> {
+    /// Asynchronously run probe task end-to-end, including wait for reply.
+    async fn probe(&self, tparams: TargetParams) -> Result<P::Output> {
+        let ip = tparams.addr.as_socket_ipv4().unwrap().ip().clone();
+        self.probe.update_buffer(&tparams);
+
+        let wait_for_reply_fut = {
+            let receiver = self.receiver.clone();
+            let tparams = tparams.clone();
+            let probe = self.probe.clone();
+            tokio::spawn(Self::wait_for_reply(probe, receiver, tparams))
+        };
+
+        self.send(&tparams).await;
+
+        let start = Instant::now();
+        let output = match timeout(self.timeout.clone(), wait_for_reply_fut).await {
+            Err(_elapsed) => {
+                println!("{},{},TIMEDOUT", ip, tparams.seq);
+                return Err(format!("timed out waiting for {} probe reply", tparams).into());
+            },
+            Ok(o) => {
+                let elapsed = start.elapsed();
+                println!("{},{},{}", ip, tparams.seq, elapsed.as_micros());
+                o
+            }
+        };
+        Ok(output?)
+    }
+
+    /// Send the Probe's ethernet packet on the sender AsyncSocket.
+    async fn send(&self, tparams: &TargetParams) -> Result<()> {
+        log::trace!("about to try sending via async io");
+        let buf = self.probe.get_buffer();
+        match self.sender.send(buf).await {
+            Err(e) => {
+                panic!("unhandled socket send error: {}", e);
+            }
+            Ok(length) => {
+                log::trace!("sent {} bytes for request {}", length, tparams);
+            }
+        }
+        Ok(())
+    }
+
+    /// Send the Probe's ethernet packet on the sender AsyncSocket.
+    async fn wait_for_reply(probe: Arc<P>, receiver: AsyncSocket, tparams: TargetParams) -> P::Output {
+        loop {
+            let mut buf: Vec<u8> = Vec::with_capacity(4096);
+            let mut uninit = buf.spare_capacity_mut();
+            match receiver.recv(&mut uninit).await {
+                Err(e) => {
+                    panic!("unhandled socket read error: {}", e);
+                },
+                Ok(len) => {
+                    // this is safe because we have the exact number of bytes written into the
+                    // uinit
+                    unsafe {
+                        buf.set_len(len);
+                    }
+                    log::trace!("received {} bytes for reply {}", len, tparams);
+                    if let Some(output) = probe.validate_response(&buf, &tparams) {
+                        return output
+                    }
+                },
+            }
+        }
+    }
+}
+
+// Generic framework for asynchronously conducting network scans.
+pub struct Prober<P: ProbeAnd> {
+    queue: ArrayQueue<Box<ProbeTask<P>>>,
+}
+
+impl<P: ProbeAnd> Prober<P> {
+    pub fn new(probes: Vec<P>, ethernet_conf: EthernetConf, timeout: Duration) -> Result<Self> {
+        let sender = IcmpProber::create_sender(&ethernet_conf)?;
+
+        let queue = ArrayQueue::new(probes.len());
+        for probe in probes {
+            let receiver = IcmpProber::create_receiver()?;
+            let probe_task = ProbeTask {
+                probe: Arc::new(probe),
+                sender: sender.clone(),
+                receiver,
+                timeout: timeout.clone(),
+            };
+            queue.push(Box::new(probe_task)).expect(
+                "the queue should have the same capacity as the number of elements we are pushing",
+            );
+        }
+        Ok(Self { queue })
+    }
+
+    // Execute async task to probe the given target.
+    pub async fn probe(&self, tparams: TargetParams) -> Result<P::Output> {
+        let mut task = loop {
+            log::trace!("try retrieving probe task {}", tparams);
+            match self.queue.pop() {
+                Some(b) => break b,
+                None => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        };
+
+        let output = task.probe(tparams).await?;
+
+        loop {
+            log::trace!("try pushing task back onto queue");
+            match self.queue.push(task) {
+                Ok(_) => break,
+                Err(b) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    task = b;
+                }
+            }
+        }
+        Ok(output)
+    }
+}
 
 // A ring buffer of IcmpProbes that makes concurrent pings easy.
 //
