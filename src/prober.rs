@@ -2,6 +2,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use crossbeam::queue::ArrayQueue;
 use serde::Serialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -25,29 +26,20 @@ impl std::fmt::Display for TargetParams {
     }
 }
 
-/// A probe managed by a `ProbeTask`. `Probe` implementations are expected to maintain a cached
-/// request packet buffer that gets updated by the `ProbeTask` just before sending the request to
-/// the current target.
+/// A probe managed by a `ProbeTask`. `Probe` implementations are largely responsible for
+/// generating and optionally caching request packets.
+#[async_trait]
 pub trait Probe {
     // The output generated when the `Prober` successfully detects a response to the `Probe` for a
     // given `TargetParams`.
     type Output: Send + Serialize;
 
-    /// Packet buffers are owned by probe module types, so in order to update a particular module
-    /// instance before we send a request we need to tell it about the next target.
-    fn update_buffer(&mut self, params: &TargetParams) -> Result<()>;
-
-    /// Packet buffers are owned by probe module types; in order to send a request, we need a
-    /// reference to the type's buffer.
-    fn get_buffer(&self) -> &[u8];
+    /// Send request using the given `AsyncSocket` with the given `TargetParams`.
+    async fn send(&mut self, socket: AsyncSocket, params: &TargetParams) -> Result<()>;
 
     /// Return true if the given buffer matches the expectation for the given target parameters.
     // TODO: might be more efficient to use pcap or something else to filter packets
     fn validate_response(&self, buf: &[u8], params: &TargetParams) -> Option<Self::Output>;
-
-    // TODO: should probes themselves be responsible for sending and receiving/filtering packets?
-    //fn send(&mut self, socket: AsyncSocket, seq: u16) -> Result<()>;
-    //fn recv(&mut self, socket: AsyncSocket) -> Result<Self::Output>;
 }
 
 /// ProbeTask holds general probe configuration and the sockets used to send request packets.
@@ -89,8 +81,10 @@ struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
 impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
     /// Asynchronously run probe task end-to-end, including wait for reply.
     async fn probe(&mut self, tparams: TargetParams) -> Result<P::Output> {
-        self.probe.lock().await.update_buffer(&tparams)?;
-
+        // begin waiting for reply before sending request to avoid potential race between request
+        // send and reply wait. in retrospect, this shouldn't actually be a problem since while the
+        // receiver socket is idle the kernel is probably filling a buffer with packets that only
+        // get filtered when the following task is running.
         let wait_for_reply_fut = {
             let receiver = self.receiver.clone();
             let tparams = tparams.clone();
@@ -98,7 +92,11 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
             tokio::spawn(Self::wait_for_reply(probe, receiver, tparams))
         };
 
-        self.send(&tparams).await?;
+        self.probe
+            .lock()
+            .await
+            .send(self.sender.clone(), &tparams)
+            .await?;
 
         let start = Instant::now();
         let output = match timeout(self.timeout.clone(), wait_for_reply_fut).await {
@@ -113,22 +111,6 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
             }
         };
         Ok(output?)
-    }
-
-    /// Send the Probe's ethernet packet on the sender AsyncSocket.
-    async fn send(&self, tparams: &TargetParams) -> Result<()> {
-        log::trace!("about to try sending via async io");
-        let guard = self.probe.lock().await;
-        let buf = guard.get_buffer();
-        match self.sender.send(buf).await {
-            Err(e) => {
-                panic!("unhandled socket send error: {}", e);
-            }
-            Ok(length) => {
-                log::trace!("sent {} bytes for request {}", length, tparams);
-            }
-        }
-        Ok(())
     }
 
     /// Send the Probe's ethernet packet on the sender AsyncSocket.

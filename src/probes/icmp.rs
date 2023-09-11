@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
 
+use async_trait::async_trait;
 use pnet::packet::{
     ethernet::MutableEthernetPacket,
     icmp::echo_reply::EchoReplyPacket,
@@ -13,6 +14,7 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::ethernet::EthernetConf;
 use crate::prober::{Probe, TargetParams};
+use crate::socket::AsyncSocket;
 
 const ETHERNET_PACKET_MIN_SIZE: usize = MutableEthernetPacket::minimum_packet_size();
 const IPV4_PACKET_MIN_SIZE: usize = Ipv4Packet::minimum_packet_size();
@@ -41,9 +43,7 @@ impl IcmpProbe {
         Ok(v)
     }
 
-    pub fn new(
-        ethernet_conf: &EthernetConf,
-    ) -> Result<Self> {
+    pub fn new(ethernet_conf: &EthernetConf) -> Result<Self> {
         let mut buf = [0u8; ICMP_REQUEST_PACKET_SIZE];
         {
             let mut ethernet_packet = MutableEthernetPacket::new(&mut buf).expect("meow");
@@ -89,9 +89,7 @@ impl IcmpProbe {
             icmp_packet.set_identifier(42);
         }
 
-        Ok(Self {
-            buf,
-        })
+        Ok(Self { buf })
     }
 
     /// Updates the icmp buffer with the current icmp sequence and the new icmp checksum.
@@ -117,22 +115,26 @@ impl IcmpProbe {
         );
         icmp_packet.set_checksum(checksum);
     }
-
 }
 
 #[derive(Serialize)]
 pub struct IcmpOutput {}
 
+#[async_trait]
 impl Probe for IcmpProbe {
     type Output = IcmpOutput;
 
-    fn update_buffer(&mut self, tparams: &TargetParams) -> Result<()> {
+    async fn send(&mut self, socket: AsyncSocket, tparams: &TargetParams) -> Result<()> {
         self.update_icmp_request_packet(&tparams.addr, tparams.seq);
+        match socket.send(&self.buf).await {
+            Err(e) => {
+                panic!("unhandled socket send error: {}", e);
+            }
+            Ok(length) => {
+                log::trace!("sent {} bytes for request {}", length, tparams);
+            }
+        }
         Ok(())
-    }
-
-    fn get_buffer(&self) -> &[u8] {
-        &self.buf
     }
 
     fn validate_response(&self, buf: &[u8], tparams: &TargetParams) -> Option<Self::Output> {

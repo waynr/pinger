@@ -15,8 +15,8 @@ mod socket;
 
 use error::Result;
 use ethernet::EthernetConf;
-use probes::icmp::IcmpProbe;
 use prober::{Prober, TargetParams};
+use probes::icmp::IcmpProbe;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
             for i in 0..target.count {
                 interval.tick().await;
                 let p = p.clone();
-                let tparams = TargetParams{
+                let tparams = TargetParams {
                     addr: target.addr,
                     seq: i,
                 };
