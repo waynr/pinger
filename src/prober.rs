@@ -25,7 +25,9 @@ impl std::fmt::Display for TargetParams {
     }
 }
 
-// A probe managed by the Prober.
+/// A probe managed by the `Prober`. `Probe` implementations are expected to maintain a cached request
+/// packet buffer that gets updated by the `ProbeTask` just before sending the request to the
+/// current target.
 pub trait Probe {
     // The output generated when the `Prober` successfully detects a response to the `Probe` for a
     // given `TargetParams`.
@@ -48,6 +50,28 @@ pub trait Probe {
     //fn recv(&mut self, socket: AsyncSocket) -> Result<Self::Output>;
 }
 
+/// Abstraction for containing individual socket instances.
+///
+/// # Notes on Socket choice:
+///
+/// The reason I choose Domain::PACKET is that I have been reading the `zmap` paper recently[1] and
+/// learned one of the tricks they use to achieve such high packet throughput is to use AF_PACKET
+/// and manually construct Ethernet packets. This has two primary benefits:
+///
+/// First, it bypasses TCP/IP/whatever handling at the kernel level. This reduces kernel-specific
+/// cpu and memory overhead in high throughput applications.
+///
+/// Second, in network mapping (or ICMP echo as is the case here) there are often very few
+/// differences between the different request packets, which means one can optimize the
+/// program to reduce memory allocations by pre-allocating request packet buffers rather
+/// constructing them for every request. Request packet buffers are only needed for the duration of
+/// each send call, after which they can re-used for subsequent requests.
+///
+/// To be honest, for a simple exercise like this the memory allocation optimization probably isn't
+/// necessary, but I've been wondering how I would implement something zmap-like in Rust while
+/// reading the original zmap paper and this interview is a good chance to do that.
+///
+/// [1] https://zmap.io/paper.pdf
 #[derive(Debug)]
 struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
     probe: Arc<Mutex<P>>,
@@ -140,7 +164,33 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
     }
 }
 
-// Generic framework for asynchronously conducting network scans.
+/// Generic framework for asynchronously conducting network scans. A ring buffer of Probes that
+/// makes concurrent network probes easy.
+///
+/// # Implementation Notes
+///
+/// (these notes were originally applicable to the non-generic icmp echo request implementation)
+///
+/// Rather than using a single socket shared across all packets, we want separate sockets to
+/// simplify implementation of echo reply timeout on each echo request-reply pair. The idea
+/// here being that in the course of each `ping` call each socket only accepts the reply packet
+/// corresponding to the request it just sent and performs a tokio sleeps between non-blocking
+/// `recv` attempts so that an outer tokio timeout future can cancel the inner future at the
+/// specified icmp timeout.
+///
+/// One potential limitation here is going to be the number of concurrent pings that can run
+/// since the number of `IcmpProbe` instances is limited using the ArrayQueue. One possibility
+/// to address this would be to use crossbeam's `SegQueue`[1] type which is an unbounded data
+/// structure with similar semantics. In this case we wouldn't even need to initialize the queue
+/// here, we could create new `IcmpProbe`s whenever `SeqQueue.pop` returns None, then push the
+/// new socket onto the queue when its first usage is finished. This would allow the queue to
+/// grow to its natural size for a given set of input parameters (count, interval) and network
+/// characteristics (round trip latency).
+///
+/// I'm going to stick with ArrayQueue for now because I don't think it's necessary to really
+/// perfect the concurrency characteristics yet, it's just something I wanted to point out.
+///
+/// [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
 pub struct Prober<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
     queue: ArrayQueue<Box<ProbeTask<P>>>,
 }
@@ -199,31 +249,6 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
     }
 }
 
-// A ring buffer of IcmpProbes that makes concurrent pings easy.
-//
-// # Implementation Notes
-//
-// Rather than using a single socket shared across all packets, we want separate sockets to
-// simplify implementation of echo reply timeout on each echo request-reply pair. The idea
-// here being that in the course of each `ping` call each socket only accepts the reply packet
-// corresponding to the request it just sent and performs a tokio sleeps between non-blocking
-// `recv` attempts so that an outer tokio timeout future can cancel the inner future at the
-// specified icmp timeout.
-//
-// One potential limitation here is going to be the number of concurrent pings that can run
-// since the number of `IcmpProbe` instances is limited using the ArrayQueue. One possibility
-// to address this would be to use crossbeam's `SegQueue`[1] type which is an unbounded data
-// structure with similar semantics. In this case we wouldn't even need to initialize the queue
-// here, we could create new `IcmpProbe`s whenever `SeqQueue.pop` returns None, then push the
-// new socket onto the queue when its first usage is finished. This would allow the queue to
-// grow to its natural size for a given set of input parameters (count, interval) and network
-// characteristics (round trip latency).
-//
-// I'm going to stick with ArrayQueue for now because I don't think it's necessary to really
-// perfect the concurrency characteristics here, it's just something I wanted to point out.
-//
-// [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
-//
 fn create_receiver() -> Result<AsyncSocket> {
     // note: for some reason using Domain::PACKET as is done in zmap (libpcap, really) doesn't
     // work here -- the socket never becomes ready for reading. for now I'm setting it back to
