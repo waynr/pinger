@@ -1,12 +1,13 @@
-use std::time::{Duration, Instant};
 use std::mem::MaybeUninit;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossbeam::queue::ArrayQueue;
 use serde::Serialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use tokio::time::timeout;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 use crate::error::Result;
 use crate::ethernet::EthernetConf;
@@ -16,8 +17,8 @@ use crate::socket::AsyncSocket;
 /// Parametes describing a single `Probe` target.
 #[derive(Clone)]
 pub struct TargetParams {
-    addr: SockAddr,
-    seq: u16,
+    pub addr: Ipv4Addr,
+    pub seq: u16,
 }
 
 impl std::fmt::Display for TargetParams {
@@ -52,7 +53,6 @@ pub trait Probe {
     // TODO: might be more efficient to use pcap or something else to filter packets
     fn validate_response(&self, buf: &[u8], params: &TargetParams) -> Option<Self::Output>;
 
-
     // TODO: should probes themselves be responsible for sending and receiving/filtering packets?
     //fn send(&mut self, socket: AsyncSocket, seq: u16) -> Result<()>;
     //fn recv(&mut self, socket: AsyncSocket) -> Result<Self::Output>;
@@ -68,7 +68,7 @@ struct ProbeTask<P: ProbeAnd> {
     sender: AsyncSocket,
     // TODO: there is a risk if a `ProbeTask` is idle for too long that the socket's kernel-side
     // receive buffer fills up with packets. this could lead to two problems: packet loss on the
-    // kernel side and unnecessary cpu usage on the user side when draining the receiver. 
+    // kernel side and unnecessary cpu usage on the user side when draining the receiver.
     //
     // in the long term it's probably better to have one single receiving socket "owned" by the
     // `Prober` which distributes matching `Probe::Output` via oneshot channels to `ProbeTasks`
@@ -83,7 +83,6 @@ struct ProbeTask<P: ProbeAnd> {
 impl<P: ProbeAnd> ProbeTask<P> {
     /// Asynchronously run probe task end-to-end, including wait for reply.
     async fn probe(&mut self, tparams: TargetParams) -> Result<P::Output> {
-        let ip = tparams.addr.as_socket_ipv4().unwrap().ip().clone();
         self.probe.lock().await.update_buffer(&tparams);
 
         let wait_for_reply_fut = {
@@ -98,12 +97,12 @@ impl<P: ProbeAnd> ProbeTask<P> {
         let start = Instant::now();
         let output = match timeout(self.timeout.clone(), wait_for_reply_fut).await {
             Err(_elapsed) => {
-                println!("{},{},TIMEDOUT", ip, tparams.seq);
+                println!("{},{},TIMEDOUT", tparams.addr, tparams.seq);
                 return Err(format!("timed out waiting for {} probe reply", tparams).into());
-            },
+            }
             Ok(o) => {
                 let elapsed = start.elapsed();
-                println!("{},{},{}", ip, tparams.seq, elapsed.as_micros());
+                println!("{},{},{}", tparams.addr, tparams.seq, elapsed.as_micros());
                 o
             }
         };
@@ -127,14 +126,18 @@ impl<P: ProbeAnd> ProbeTask<P> {
     }
 
     /// Send the Probe's ethernet packet on the sender AsyncSocket.
-    async fn wait_for_reply(probe: Arc<Mutex<P>>, receiver: AsyncSocket, tparams: TargetParams) -> P::Output {
+    async fn wait_for_reply(
+        probe: Arc<Mutex<P>>,
+        receiver: AsyncSocket,
+        tparams: TargetParams,
+    ) -> P::Output {
         loop {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
             let mut uninit = buf.spare_capacity_mut();
             match receiver.recv(&mut uninit).await {
                 Err(e) => {
                     panic!("unhandled socket read error: {}", e);
-                },
+                }
                 Ok(len) => {
                     // this is safe because we have the exact number of bytes written into the
                     // uinit
@@ -143,9 +146,9 @@ impl<P: ProbeAnd> ProbeTask<P> {
                     }
                     log::trace!("received {} bytes for reply {}", len, tparams);
                     if let Some(output) = probe.lock().await.validate_response(&buf, &tparams) {
-                        return output
+                        return output;
                     }
-                },
+                }
             }
         }
     }
