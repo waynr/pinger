@@ -10,12 +10,14 @@ use pnet::packet::{
     ipv4::{Ipv4Packet, MutableIpv4Packet},
     MutablePacket, Packet,
 };
-use socket2::SockAddr ;
+use serde::Serialize;
+use socket2::SockAddr;
 use tokio::time::timeout;
 
 use crate::error::Result;
-use crate::socket::AsyncSocket;
 use crate::ethernet::EthernetConf;
+use crate::prober::{Probe, TargetParams};
+use crate::socket::AsyncSocket;
 
 const ETHERNET_PACKET_MIN_SIZE: usize = MutableEthernetPacket::minimum_packet_size();
 const IPV4_PACKET_MIN_SIZE: usize = Ipv4Packet::minimum_packet_size();
@@ -233,6 +235,30 @@ impl IcmpProbe {
     }
 }
 
+#[derive(Serialize)]
+pub struct IcmpOutput {}
+
+impl Probe for IcmpProbe {
+    type Output = IcmpOutput;
+
+    fn update_buffer(&mut self, tparams: &TargetParams) -> Result<()> {
+        self.update_icmp_request_packet(&tparams.addr, tparams.seq);
+        Ok(())
+    }
+
+    fn get_buffer(&self) -> &[u8] {
+        &self.buf
+    }
+
+    fn validate_response(&self, buf: &[u8], tparams: &TargetParams) -> Option<Self::Output> {
+        if is_expected_packet(buf, &tparams.addr, tparams.seq) {
+            Some(IcmpOutput {})
+        } else {
+            None
+        }
+    }
+}
+
 /// Check that the given buffer is:
 /// * from the expected source IP
 /// * the right kind of IP packet (ICMP)
@@ -281,4 +307,3 @@ fn is_expected_packet(reply_buf: &[u8], addr: &Ipv4Addr, seq: u16) -> bool {
 
     reply_packet.get_sequence_number() == seq
 }
-
