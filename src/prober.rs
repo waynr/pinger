@@ -195,7 +195,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
                 }
             }
         }
-        None
+        output
     }
 }
 
