@@ -33,12 +33,16 @@ use crate::ethernet::EthernetConf;
 //
 // [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
 //
-pub struct Prober {
+pub struct IcmpProber {
     socket_rb: ArrayQueue<Box<IcmpProbe>>,
 }
 
-impl Prober {
-    pub fn new(ethernet_conf: EthernetConf, rb_size: usize, icmp_timeout: Duration) -> Result<Self> {
+impl IcmpProber {
+    pub fn new(
+        ethernet_conf: EthernetConf,
+        rb_size: usize,
+        icmp_timeout: Duration,
+    ) -> Result<Self> {
         let sender = Self::create_sender(&ethernet_conf)?;
         let socket_rb: ArrayQueue<Box<IcmpProbe>> = ArrayQueue::new(rb_size);
         for _ in 0..rb_size {
@@ -146,4 +150,3 @@ impl Prober {
         }
     }
 }
-

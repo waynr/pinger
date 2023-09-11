@@ -16,7 +16,7 @@ mod socket;
 
 use error::Result;
 use ethernet::EthernetConf;
-use prober::Prober;
+use prober::IcmpProber;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     let icmp_timeout = Duration::from_millis(cli.icmp_timeout);
 
     let queue_size = 100usize;
-    let prober = Arc::new(Prober::new(ethernet_conf, queue_size, icmp_timeout)?);
+    let prober = Arc::new(IcmpProber::new(ethernet_conf, queue_size, icmp_timeout)?);
 
     let mut set = JoinSet::new();
 
