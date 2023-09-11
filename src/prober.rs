@@ -25,9 +25,9 @@ impl std::fmt::Display for TargetParams {
     }
 }
 
-/// A probe managed by the `Prober`. `Probe` implementations are expected to maintain a cached request
-/// packet buffer that gets updated by the `ProbeTask` just before sending the request to the
-/// current target.
+/// A probe managed by a `ProbeTask`. `Probe` implementations are expected to maintain a cached
+/// request packet buffer that gets updated by the `ProbeTask` just before sending the request to
+/// the current target.
 pub trait Probe {
     // The output generated when the `Prober` successfully detects a response to the `Probe` for a
     // given `TargetParams`.
@@ -50,7 +50,7 @@ pub trait Probe {
     //fn recv(&mut self, socket: AsyncSocket) -> Result<Self::Output>;
 }
 
-/// Abstraction for containing individual socket instances.
+/// ProbeTask holds general probe configuration and the sockets used to send request packets.
 ///
 /// # Notes on Socket choice:
 ///
@@ -66,10 +66,6 @@ pub trait Probe {
 /// program to reduce memory allocations by pre-allocating request packet buffers rather
 /// constructing them for every request. Request packet buffers are only needed for the duration of
 /// each send call, after which they can re-used for subsequent requests.
-///
-/// To be honest, for a simple exercise like this the memory allocation optimization probably isn't
-/// necessary, but I've been wondering how I would implement something zmap-like in Rust while
-/// reading the original zmap paper and this interview is a good chance to do that.
 ///
 /// [1] https://zmap.io/paper.pdf
 #[derive(Debug)]
