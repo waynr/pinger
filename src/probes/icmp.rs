@@ -87,7 +87,9 @@ impl IcmpProbe {
             icmp_packet.set_identifier(42);
         }
 
-        Ok(Self { buf: Arc::new(Mutex::new(buf)) })
+        Ok(Self {
+            buf: Arc::new(Mutex::new(buf)),
+        })
     }
 
     /// Updates the icmp buffer with the current icmp sequence and the new icmp checksum.
@@ -125,7 +127,8 @@ impl Probe for IcmpProbe {
     type Output = IcmpOutput;
 
     async fn send(&mut self, socket: AsyncSocket, tparams: &TargetParams) -> Result<()> {
-        self.update_icmp_request_packet(&tparams.addr, tparams.seq).await;
+        self.update_icmp_request_packet(&tparams.addr, tparams.seq)
+            .await;
         match socket.send(self.buf.lock().await.as_slice()).await {
             Err(e) => {
                 panic!("unhandled socket send error: {}", e);

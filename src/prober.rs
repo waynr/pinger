@@ -38,6 +38,18 @@ pub trait Probe {
     /// Return true if the given buffer matches the expectation for the given target parameters.
     // TODO: might be more efficient to use pcap or something else to filter packets
     fn validate_response(&self, buf: &[u8], params: &TargetParams) -> Option<Self::Output>;
+
+    /// Return an AsyncSocket configured for this specific type of probe. Defaults to a RAW IPV4
+    /// socket that receives ICMPV4 packets.
+    fn create_receiver(_: &EthernetConf) -> Result<AsyncSocket> {
+        create_receiver()
+    }
+
+    /// Return an AsyncSocket configured for this specific type of probe. Defaults to a RAW
+    /// AF_PACKET socket bound to the interface specified in the `&EthernetConf`.
+    fn create_sender(ec: &EthernetConf) -> Result<AsyncSocket> {
+        create_sender(ec)
+    }
 }
 
 /// ProbeTask holds general probe configuration and the sockets used to send request packets.
@@ -171,11 +183,11 @@ pub struct Prober<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
 
 impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
     pub fn new(probes: Vec<P>, ethernet_conf: EthernetConf, timeout: Duration) -> Result<Self> {
-        let sender = create_sender(&ethernet_conf)?;
+        let sender = P::create_sender(&ethernet_conf)?;
 
         let queue = ArrayQueue::new(probes.len());
         for probe in probes {
-            let receiver = create_receiver()?;
+            let receiver = P::create_receiver(&ethernet_conf)?;
             let probe_task = ProbeTask {
                 probe,
                 sender: sender.clone(),
