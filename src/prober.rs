@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crossbeam::queue::ArrayQueue;
 use serde::Serialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::error::Result;
@@ -91,9 +92,7 @@ struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
 impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
     /// Asynchronously run probe task end-to-end, including wait for reply.
     async fn probe(&mut self, tparams: TargetParams) -> Result<P::Output> {
-        self.probe
-            .send(self.sender.clone(), &tparams)
-            .await?;
+        self.probe.send(self.sender.clone(), &tparams).await?;
 
         // it's safe-ish to have a gap between sending the request and receiving the packet here
         // because the receiver `AsyncSocket` is always listening for packets and the underlying
@@ -123,10 +122,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
     }
 
     /// Send the Probe's ethernet packet on the sender AsyncSocket.
-    async fn wait_for_reply(
-        &self,
-        tparams: &TargetParams,
-    ) -> P::Output {
+    async fn wait_for_reply(&self, tparams: &TargetParams) -> P::Output {
         loop {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
             let mut uninit = buf.spare_capacity_mut();
@@ -179,12 +175,14 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
 /// [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
 pub struct Prober<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
     queue: ArrayQueue<Box<ProbeTask<P>>>,
+    semaphore: Semaphore,
 }
 
 impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
     pub fn new(probes: Vec<P>, ethernet_conf: EthernetConf, timeout: Duration) -> Result<Self> {
         let sender = P::create_sender(&ethernet_conf)?;
 
+        let semaphore = Semaphore::new(probes.len());
         let queue = ArrayQueue::new(probes.len());
         for probe in probes {
             let receiver = P::create_receiver(&ethernet_conf)?;
@@ -198,17 +196,48 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
                 "the queue should have the same capacity as the number of elements we are pushing",
             );
         }
-        Ok(Self { queue })
+
+        Ok(Self { queue, semaphore })
     }
 
     // Execute async task to probe the given target.
     pub async fn probe(&self, tparams: TargetParams) -> Option<P::Output> {
-        let mut task = loop {
+        let (mut task, _permit) = loop {
+            // if there are no available permits then there is no point in continuing
+            if self.semaphore.available_permits() == 0 {
+                panic!("Prober semaphore count reached 0, unable to process additional probes")
+            }
+
+            let permit = match self.semaphore.acquire().await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("semaphore unexpectedly closed: {e:?}");
+                    return None;
+                }
+            };
+
             log::trace!("try retrieving probe task {}", tparams);
             match self.queue.pop() {
-                Some(b) => break b,
+                Some(b) => break (b, permit),
                 None => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    // in practice there are the same number of SemaphorePermits as there are
+                    // ArrayQueue elements so as long as we have a permit (which we do at this
+                    // point), this should never happen unless there was a panic in another async
+                    // task that resulted in that task's ProbeTask not being added back to the
+                    // queue.
+                    //
+                    // regardless of why we are missing a ProbeTask, if it happens, then we need to
+                    // mark the currently-helped SemaphorePermit as forgotten before continuing so
+                    // we can match the number of ArrayQueue elements to the number of
+                    // SemaphorePermits
+                    permit.forget();
+
+                    // this isn't really a sustainable solution as we could end up with 0 permits.
+                    // so we need to log it
+                    log::error!(
+                        "found empty queue when retrieving ProbeTask for {}",
+                        tparams
+                    );
                 }
             }
         };
@@ -226,8 +255,18 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
             match self.queue.push(task) {
                 Ok(_) => break,
                 Err(b) => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    task = b;
+                    // after initialization in Prober::new() we never add any additional
+                    // ProbeTasks, so we should never run out of capacity in the ArrayQueue for
+                    // pushing one we have retrieved. which means we should never land on this
+                    // branch.
+                    //
+                    // if we do, log an error, drop the ProbeTask, and return the output.
+                    log::error!(
+                        "unable to push ProbeTask back onto queue {}, dropping it now",
+                        tparams
+                    );
+                    drop(b); // not strictly necessary, just prefering to be explicit here
+                    break;
                 }
             }
         }
