@@ -227,7 +227,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
                     // queue.
                     //
                     // regardless of why we are missing a ProbeTask, if it happens, then we need to
-                    // mark the currently-helped SemaphorePermit as forgotten before continuing so
+                    // mark the currently-held SemaphorePermit as forgotten before continuing so
                     // we can match the number of ArrayQueue elements to the number of
                     // SemaphorePermits
                     permit.forget();
