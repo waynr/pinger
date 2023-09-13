@@ -120,7 +120,16 @@ impl IcmpProbe {
 }
 
 #[derive(Debug, Serialize)]
-pub struct IcmpOutput {}
+pub struct IcmpOutput {
+    addr: Ipv4Addr,
+    seq: u16,
+}
+
+impl std::fmt::Display for IcmpOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{},{}", self.addr, self.seq)
+    }
+}
 
 #[async_trait]
 impl Probe for IcmpProbe {
@@ -142,7 +151,10 @@ impl Probe for IcmpProbe {
 
     fn validate_response(&self, buf: &[u8], tparams: &TargetParams) -> Option<Self::Output> {
         if is_expected_packet(buf, &tparams.addr, tparams.seq) {
-            Some(IcmpOutput {})
+            Some(IcmpOutput {
+                addr: tparams.addr.clone(),
+                seq: tparams.seq,
+            })
         } else {
             None
         }

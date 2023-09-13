@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::ethernet::EthernetConf;
 use crate::socket::AsyncSocket;
 
@@ -22,7 +22,21 @@ pub struct TargetParams {
 
 impl std::fmt::Display for TargetParams {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?} ({})", self.addr, self.seq)
+        write!(f, "{},{}", self.addr, self.seq)
+    }
+}
+
+pub enum ProbeReport<P: Probe> {
+    ReceivedOutput(P::Output, Duration),
+    TimedOut(TargetParams),
+}
+
+impl<P: Probe> std::fmt::Display for ProbeReport<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::ReceivedOutput(output, duration) => write!(f, "{output},{}", duration.as_micros()),
+            Self::TimedOut(targetparams) => write!(f, "{targetparams},DURATION"),
+        }
     }
 }
 
@@ -32,7 +46,7 @@ impl std::fmt::Display for TargetParams {
 pub trait Probe {
     // The output generated when the `Prober` successfully detects a response to the `Probe` for a
     // given `TargetParams`.
-    type Output: Send + Serialize + std::fmt::Debug;
+    type Output: Send + Serialize + std::fmt::Display;
 
     /// Send request using the given `AsyncSocket` with the given `TargetParams`.
     async fn send(&mut self, socket: AsyncSocket, params: &TargetParams) -> Result<()>;
@@ -76,7 +90,7 @@ pub trait Probe {
 struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
     probe: P,
     target_receiver: ACReceiver<TargetParams>,
-    output_sender: UnboundedSender<P::Output>,
+    output_sender: UnboundedSender<ProbeReport<P>>,
     sender: AsyncSocket,
     // TODO: there is a risk if a `ProbeTask` is idle for too long that the socket's kernel-side
     // receive buffer fills up with packets. this could lead to two problems: packet loss on the
@@ -94,7 +108,7 @@ struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
 
 impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
     /// Asynchronously run probe task end-to-end, including wait for reply.
-    async fn probe(&mut self, tparams: &TargetParams) -> Result<P::Output> {
+    async fn probe(&mut self, tparams: &TargetParams) -> Result<ProbeReport<P>> {
         self.probe.send(self.sender.clone(), tparams).await?;
 
         // it's safe-ish to have a gap between sending the request and receiving the packet here
@@ -110,20 +124,18 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
         let wait_for_reply_fut = self.wait_for_reply(tparams);
 
         let start = Instant::now();
-        let output = match timeout(self.timeout.clone(), wait_for_reply_fut).await {
+        match timeout(self.timeout.clone(), wait_for_reply_fut).await {
             Err(_elapsed) => {
-                println!("{},{},TIMEDOUT", tparams.addr, tparams.seq);
-                return Err(Error::GenericStringError(format!(
-                    "timed out waiting for {tparams} probe reply",
-                )));
+                //println!("{},{},TIMEDOUT", tparams.addr, tparams.seq);
+                log::debug!("timed out waiting for {tparams} probe reply");
+                Ok(ProbeReport::TimedOut(tparams.clone()))
             }
             Ok(o) => {
                 let elapsed = start.elapsed();
-                println!("{},{},{}", tparams.addr, tparams.seq, elapsed.as_micros());
-                o
+                //println!("{},{},{}", tparams.addr, tparams.seq, elapsed.as_micros());
+                Ok(ProbeReport::ReceivedOutput(o, elapsed))
             }
-        };
-        Ok(output)
+        }
     }
 
     /// Send the Probe's ethernet packet on the sender AsyncSocket.
@@ -137,7 +149,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
                 }
                 Ok(len) => {
                     // this is safe because we have the exact number of bytes written into the
-                    // uinit
+                    // MaybeUninit buf
                     unsafe {
                         buf.set_len(len);
                     }
@@ -160,14 +172,14 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
                     break;
                 }
             };
-            let output = match self.probe(&target).await {
-                Ok(o) => o,
+            let probe_report = match self.probe(&target).await {
+                Ok(probe_report) => probe_report,
                 Err(e) => {
                     log::debug!("probe of {target} failed: {e}");
                     continue;
-                },
+                }
             };
-            match self.output_sender.send(output) {
+            match self.output_sender.send(probe_report) {
                 Ok(_) => (),
                 Err(e) => {
                     log::debug!("shutting down ProbeTask after failing to send output: {e}");
@@ -185,18 +197,26 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
 #[derive(Clone)]
 pub struct Prober<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
     target_receiver: ACReceiver<TargetParams>,
-    output_sender: UnboundedSender<P::Output>,
+    output_sender: UnboundedSender<ProbeReport<P>>,
 }
 
 impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
-    pub fn new() -> Result<(Self, ACSender<TargetParams>, UnboundedReceiver<P::Output>)> {
+    pub fn new() -> Result<(
+        Self,
+        ACSender<TargetParams>,
+        UnboundedReceiver<ProbeReport<P>>,
+    )> {
         let (output_sender, output_receiver) = unbounded_channel();
         let (target_sender, target_receiver) = async_channel::unbounded();
 
-        Ok((Self {
-            target_receiver,
-            output_sender,
-        }, target_sender, output_receiver))
+        Ok((
+            Self {
+                target_receiver,
+                output_sender,
+            },
+            target_sender,
+            output_receiver,
+        ))
     }
 
     pub async fn run_probes(

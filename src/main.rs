@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { prober.run_probes(probes, ethernet_conf, icmp_timeout).await });
     let output_handling_fut = tokio::spawn(async move {
         while let Some(output) = output_receiver.recv().await {
-            println!("{output:?}");
+            println!("{output}");
         }
     });
 
@@ -107,11 +107,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    log::debug!("closing sender");
+    log::debug!("closing target sender");
     target_sender.close();
 
     log::debug!("awaiting probe tasks finish");
     probe_tasks_fut.await??;
+
     log::debug!("awaiting probe tasks finish");
     output_handling_fut.await?;
 
