@@ -1,11 +1,9 @@
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use csv::{ReaderBuilder, Terminator};
 use serde::Deserialize;
-use tokio::task::JoinSet;
 
 mod error;
 mod ethernet;
@@ -87,32 +85,35 @@ async fn main() -> Result<()> {
     let icmp_timeout = Duration::from_millis(cli.icmp_timeout);
 
     let probes = IcmpProbe::many(cli.concurrent_probes, &ethernet_conf)?;
-    let prober = Arc::new(Prober::new(probes, ethernet_conf, icmp_timeout)?);
+    let (mut prober, target_sender, mut output_receiver) = Prober::new()?;
 
-    let mut set = JoinSet::new();
+    let probe_tasks_fut =
+        tokio::spawn(async move { prober.run_probes(probes, ethernet_conf, icmp_timeout).await });
+    let output_handling_fut = tokio::spawn(async move {
+        while let Some(output) = output_receiver.recv().await {
+            println!("{output:?}");
+        }
+    });
 
     for target in targets.into_iter() {
-        let p = prober.clone();
-        set.spawn(async move {
-            let mut set = JoinSet::new();
-
-            let p = p.clone();
-            let mut interval = tokio::time::interval(Duration::from_millis(target.interval));
-            for i in 0..target.count {
-                interval.tick().await;
-                let p = p.clone();
-                let tparams = TargetParams {
-                    addr: target.addr,
-                    seq: i,
-                };
-                set.spawn(async move { p.probe(tparams).await });
-            }
-
-            while set.join_next().await.is_some() {}
-        });
+        let mut interval = tokio::time::interval(Duration::from_millis(target.interval));
+        for i in 0..target.count {
+            interval.tick().await;
+            let tparams = TargetParams {
+                addr: target.addr,
+                seq: i,
+            };
+            target_sender.send(tparams).await?;
+        }
     }
 
-    while set.join_next().await.is_some() {}
+    log::debug!("closing sender");
+    target_sender.close();
+
+    log::debug!("awaiting probe tasks finish");
+    probe_tasks_fut.await??;
+    log::debug!("awaiting probe tasks finish");
+    output_handling_fut.await?;
 
     Ok(())
 }

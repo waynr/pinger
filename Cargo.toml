@@ -9,22 +9,24 @@ authors = ["Wayne Warren"]
 
 [dependencies]
 
-async-trait = "0.1.73"
-
-log = "0.4.20"
-env_logger = "0.5.0"
-thiserror = "1.0.48"
-
+# network/systems stuff
 libc = "0.2"
 pnet = "0.33.0"
 socket2 = "0.5.1"
 rtnetlink = "0.13.1"
 netlink-packet-route = "0.17.1"
 
+# async stuff
 futures = "0.3.28"
 tokio = { version = "1.28", features = ["full"] }
+async-trait = "0.1.73"
+async-channel = "1.9.0"
 crossbeam = "0.8.2"
 
+# CLI/logging/serialization/error handling
 clap = { version = "4.4.2", features = ["derive"] }
 csv = "1.2.2"
 serde = { version = "1.0", features = ["derive"] }
+log = "0.4.20"
+env_logger = "0.5.0"
+thiserror = "1.0.48"

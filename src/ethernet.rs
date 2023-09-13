@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use futures::stream::TryStreamExt;
 use netlink_packet_route::rtnl::{address, constants as nlconsts, link, neighbour};
 use netlink_packet_route::LinkMessage;
-use pnet::packet:: ethernet::{EtherTypes, Ethernet};
+use pnet::packet::ethernet::{EtherTypes, Ethernet};
 use pnet::util::MacAddr;
 use rtnetlink::{new_connection, Handle, IpVersion};
 

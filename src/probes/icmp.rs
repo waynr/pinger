@@ -119,7 +119,7 @@ impl IcmpProbe {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct IcmpOutput {}
 
 #[async_trait]

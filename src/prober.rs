@@ -1,11 +1,12 @@
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
+use async_channel::{Receiver as ACReceiver, Sender as ACSender};
 use async_trait::async_trait;
-use crossbeam::queue::ArrayQueue;
 use serde::Serialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use tokio::sync::Semaphore;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::error::{Error, Result};
@@ -31,7 +32,7 @@ impl std::fmt::Display for TargetParams {
 pub trait Probe {
     // The output generated when the `Prober` successfully detects a response to the `Probe` for a
     // given `TargetParams`.
-    type Output: Send + Serialize;
+    type Output: Send + Serialize + std::fmt::Debug;
 
     /// Send request using the given `AsyncSocket` with the given `TargetParams`.
     async fn send(&mut self, socket: AsyncSocket, params: &TargetParams) -> Result<()>;
@@ -74,6 +75,8 @@ pub trait Probe {
 #[derive(Debug)]
 struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
     probe: P,
+    target_receiver: ACReceiver<TargetParams>,
+    output_sender: UnboundedSender<P::Output>,
     sender: AsyncSocket,
     // TODO: there is a risk if a `ProbeTask` is idle for too long that the socket's kernel-side
     // receive buffer fills up with packets. this could lead to two problems: packet loss on the
@@ -91,8 +94,8 @@ struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
 
 impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
     /// Asynchronously run probe task end-to-end, including wait for reply.
-    async fn probe(&mut self, tparams: TargetParams) -> Result<P::Output> {
-        self.probe.send(self.sender.clone(), &tparams).await?;
+    async fn probe(&mut self, tparams: &TargetParams) -> Result<P::Output> {
+        self.probe.send(self.sender.clone(), tparams).await?;
 
         // it's safe-ish to have a gap between sending the request and receiving the packet here
         // because the receiver `AsyncSocket` is always listening for packets and the underlying
@@ -104,7 +107,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
         // global receiving socket per `Prober` to enable high frequency scanning. this will likely
         // mean we need to spawn a separate task to wait for the reply prior to sending the request
         // to avoid races in low-latency scanning applications.
-        let wait_for_reply_fut = self.wait_for_reply(&tparams);
+        let wait_for_reply_fut = self.wait_for_reply(tparams);
 
         let start = Instant::now();
         let output = match timeout(self.timeout.clone(), wait_for_reply_fut).await {
@@ -146,133 +149,88 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
             }
         }
     }
+
+    /// Probe targets as they become avaailable on the channel
+    async fn run(&mut self) -> Result<()> {
+        loop {
+            let target = match self.target_receiver.recv().await {
+                Ok(t) => t,
+                Err(e) => {
+                    log::debug!("shutting down ProbeTask after failing to receive target: {e}");
+                    break;
+                }
+            };
+            let output = match self.probe(&target).await {
+                Ok(o) => o,
+                Err(e) => {
+                    log::debug!("probe of {target} failed: {e}");
+                    continue;
+                },
+            };
+            match self.output_sender.send(output) {
+                Ok(_) => (),
+                Err(e) => {
+                    log::debug!("shutting down ProbeTask after failing to send output: {e}");
+                    break;
+                }
+            };
+        }
+        log::debug!("ProbeTask finished running");
+        Ok(())
+    }
 }
 
 /// Generic framework for asynchronously conducting network scans. A ring buffer of Probes that
 /// makes concurrent network probes easy.
-///
-/// # Implementation Notes
-///
-/// (these notes were originally applicable to the non-generic icmp echo request implementation)
-///
-/// Rather than using a single socket shared across all packets, we want separate sockets to
-/// simplify implementation of echo reply timeout on each echo request-reply pair. The idea
-/// here being that in the course of each `ping` call each socket only accepts the reply packet
-/// corresponding to the request it just sent and performs a tokio sleeps between non-blocking
-/// `recv` attempts so that an outer tokio timeout future can cancel the inner future at the
-/// specified icmp timeout.
-///
-/// One potential limitation here is going to be the number of concurrent pings that can run
-/// since the number of `IcmpProbe` instances is limited using the ArrayQueue. One possibility
-/// to address this would be to use crossbeam's `SegQueue`[1] type which is an unbounded data
-/// structure with similar semantics. In this case we wouldn't even need to initialize the queue
-/// here, we could create new `IcmpProbe`s whenever `SeqQueue.pop` returns None, then push the
-/// new socket onto the queue when its first usage is finished. This would allow the queue to
-/// grow to its natural size for a given set of input parameters (count, interval) and network
-/// characteristics (round trip latency).
-///
-/// I'm going to stick with ArrayQueue for now because I don't think it's necessary to really
-/// perfect the concurrency characteristics yet, it's just something I wanted to point out.
-///
-/// [1] https://docs.rs/crossbeam/latest/crossbeam/queue/struct.SegQueue.html
+#[derive(Clone)]
 pub struct Prober<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
-    queue: ArrayQueue<Box<ProbeTask<P>>>,
-    semaphore: Semaphore,
+    target_receiver: ACReceiver<TargetParams>,
+    output_sender: UnboundedSender<P::Output>,
 }
 
 impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
-    pub fn new(probes: Vec<P>, ethernet_conf: EthernetConf, timeout: Duration) -> Result<Self> {
-        let sender = P::create_sender(&ethernet_conf)?;
+    pub fn new() -> Result<(Self, ACSender<TargetParams>, UnboundedReceiver<P::Output>)> {
+        let (output_sender, output_receiver) = unbounded_channel();
+        let (target_sender, target_receiver) = async_channel::unbounded();
 
-        let semaphore = Semaphore::new(probes.len());
-        let queue = ArrayQueue::new(probes.len());
-        for probe in probes {
-            let receiver = P::create_receiver(&ethernet_conf)?;
-            let probe_task = ProbeTask {
-                probe,
-                sender: sender.clone(),
-                receiver,
-                timeout: timeout.clone(),
-            };
-            queue.push(Box::new(probe_task)).expect(
-                "the queue should have the same capacity as the number of elements we are pushing",
-            );
-        }
-
-        Ok(Self { queue, semaphore })
+        Ok((Self {
+            target_receiver,
+            output_sender,
+        }, target_sender, output_receiver))
     }
 
-    // Execute async task to probe the given target.
-    pub async fn probe(&self, tparams: TargetParams) -> Option<P::Output> {
-        let (mut task, _permit) = loop {
-            // if there are no available permits then there is no point in continuing
-            if self.semaphore.available_permits() == 0 {
-                panic!("Prober semaphore count reached 0, unable to process additional probes")
-            }
+    pub async fn run_probes(
+        &mut self,
+        mut probes: Vec<P>,
+        ethernet_conf: EthernetConf,
+        timeout: Duration,
+    ) -> Result<()> {
+        let sender_socket = P::create_sender(&ethernet_conf)?;
+        let mut join_set = JoinSet::new();
 
-            let permit = match self.semaphore.acquire().await {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("semaphore unexpectedly closed: {e:?}");
-                    return None;
-                }
+        for probe in probes.drain(0..) {
+            let receiver_socket = P::create_receiver(&ethernet_conf)?;
+            let mut probe_task = ProbeTask {
+                probe,
+                sender: sender_socket.clone(),
+                receiver: receiver_socket,
+                timeout: timeout.clone(),
+                output_sender: self.output_sender.clone(),
+                target_receiver: self.target_receiver.clone(),
             };
-
-            log::trace!("try retrieving probe task {}", tparams);
-            match self.queue.pop() {
-                Some(b) => break (b, permit),
-                None => {
-                    // in practice there are the same number of SemaphorePermits as there are
-                    // ArrayQueue elements so as long as we have a permit (which we do at this
-                    // point), this should never happen unless there was a panic in another async
-                    // task that resulted in that task's ProbeTask not being added back to the
-                    // queue.
-                    //
-                    // regardless of why we are missing a ProbeTask, if it happens, then we need to
-                    // mark the currently-held SemaphorePermit as forgotten before continuing so
-                    // we can match the number of ArrayQueue elements to the number of
-                    // SemaphorePermits
-                    permit.forget();
-
-                    // this isn't really a sustainable solution as we could end up with 0 permits.
-                    // so we need to log it
-                    log::error!(
-                        "found empty queue when retrieving ProbeTask for {}",
-                        tparams
-                    );
+            join_set.spawn(async move {
+                match probe_task.run().await {
+                    Ok(_) => (),
+                    Err(e) => {
+                        log::error!("ProbeTask unexpectedly failed: {e:?}");
+                    }
                 }
-            }
-        };
-
-        let output = match task.probe(tparams.clone()).await {
-            Ok(o) => Some(o),
-            Err(e) => {
-                eprintln!("{} failed: {:?}", tparams, e);
-                None
-            }
-        };
-
-        loop {
-            log::trace!("try pushing task back onto queue");
-            match self.queue.push(task) {
-                Ok(_) => break,
-                Err(b) => {
-                    // after initialization in Prober::new() we never add any additional
-                    // ProbeTasks, so we should never run out of capacity in the ArrayQueue for
-                    // pushing one we have retrieved. which means we should never land on this
-                    // branch.
-                    //
-                    // if we do, log an error, drop the ProbeTask, and return the output.
-                    log::error!(
-                        "unable to push ProbeTask back onto queue {}, dropping it now",
-                        tparams
-                    );
-                    drop(b); // not strictly necessary, just prefering to be explicit here
-                    break;
-                }
-            }
+            });
         }
-        output
+
+        while join_set.join_next().await.is_some() {}
+
+        Ok(())
     }
 }
 

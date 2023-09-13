@@ -14,4 +14,13 @@ pub enum Error {
 
     #[error("")]
     RtnetlinkError(#[from] rtnetlink::Error),
+
+    #[error("")]
+    AsyncChannelRecvError(#[from] async_channel::RecvError),
+
+    #[error("")]
+    TokioJoinError(#[from] tokio::task::JoinError),
+
+    #[error("")]
+    AsyncChannelTargetParamsSendError(#[from] async_channel::SendError<super::prober::TargetParams>),
 }
