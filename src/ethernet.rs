@@ -7,7 +7,7 @@ use pnet::packet:: ethernet::{EtherTypes, Ethernet};
 use pnet::util::MacAddr;
 use rtnetlink::{new_connection, Handle, IpVersion};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Information about the interface on which we will emit packets and listen for responses.
 #[derive(Debug)]
@@ -20,7 +20,7 @@ pub struct InterfaceInfo {
 }
 
 impl TryFrom<LinkMessage> for InterfaceInfo {
-    type Error = Box<dyn std::error::Error>;
+    type Error = Error;
 
     fn try_from(lm: LinkMessage) -> Result<InterfaceInfo> {
         let index = lm.header.index;
@@ -32,9 +32,9 @@ impl TryFrom<LinkMessage> for InterfaceInfo {
                 link::nlas::Nla::IfName(name) => Some(name.clone()),
                 _ => None,
             })
-            .ok_or::<Box<dyn std::error::Error>>(
-                format!("couldn't find interface name for {index}").into(),
-            )?;
+            .ok_or(Error::GenericStringError(format!(
+                "couldn't find interface name for {index}"
+            )))?;
 
         let mac_addr = lm
             .nlas
@@ -45,9 +45,9 @@ impl TryFrom<LinkMessage> for InterfaceInfo {
                 }
                 _ => None,
             })
-            .ok_or::<Box<dyn std::error::Error>>(
-                format!("couldn't find MAC address for interface {name} (idx: {index})").into(),
-            )?;
+            .ok_or(Error::GenericStringError(format!(
+                "couldn't find MAC address for interface {name} (idx: {index})"
+            )))?;
 
         Ok(InterfaceInfo {
             name,
@@ -66,10 +66,10 @@ impl InterfaceInfo {
             .set_link_index_filter(self.index)
             .execute();
 
-        let notfoundmsg = format!(
+        let notfounderr = Error::GenericStringError(format!(
             "unable to retrieve address for interface {} (idx {})",
             self.name, self.index
-        );
+        ));
 
         while let Some(msg) = addresses.try_next().await? {
             if msg.header.family as u16 != nlconsts::AF_INET {
@@ -85,11 +85,11 @@ impl InterfaceInfo {
                     }
                     _ => None,
                 })
-                .ok_or::<Box<dyn std::error::Error>>(notfoundmsg.into())?;
+                .ok_or(notfounderr)?;
             return Ok(());
         }
 
-        Err(notfoundmsg.into())
+        Err(notfounderr)
     }
 }
 
@@ -159,7 +159,9 @@ async fn get_default_route_interface_index(handle: Handle) -> Result<u32> {
             return Ok(idx);
         }
     }
-    Err(format!("couldn't find suitable default route").into())
+    Err(Error::GenericStringError(format!(
+        "couldn't find suitable default route"
+    )))
 }
 
 async fn get_interface_by_index(handle: Handle, interface_index: u32) -> Result<InterfaceInfo> {
@@ -170,7 +172,9 @@ async fn get_interface_by_index(handle: Handle, interface_index: u32) -> Result<
         log::debug!("found interface {0}: {ii:?}", ii.name);
         ii
     } else {
-        return Err(format!("couldn't find netlink info for interface {interface_index}").into());
+        return Err(Error::GenericStringError(format!(
+            "couldn't find netlink info for interface {interface_index}"
+        )));
     };
 
     ii.retrieve_address(handle).await?;
@@ -190,7 +194,9 @@ async fn get_interface_by_name(handle: Handle, interface_name: String) -> Result
         log::debug!("found interface {interface_name}: {ii:?}");
         ii
     } else {
-        return Err(format!("couldn't find netlink info for {interface_name}").into());
+        return Err(Error::GenericStringError(format!(
+            "couldn't find netlink info for {interface_name}"
+        )));
     };
 
     ii.retrieve_address(handle).await?;
@@ -222,9 +228,12 @@ async fn get_neighbor_by_interface(handle: Handle, interface: &InterfaceInfo) ->
                 }
                 _ => None,
             })
-            .ok_or(format!("found neighbor for {interface:?} but no MAC address: {msg:?}").into());
+            .ok_or(Error::GenericStringError(format!(
+                "found neighbor for {interface:?} but no MAC address: {msg:?}"
+            )));
     }
 
-    Err(format!("unable to find neighbor MAC address for interface {interface:?}").into())
+    Err(Error::GenericStringError(format!(
+        "unable to find neighbor MAC address for interface {interface:?}"
+    )))
 }
-

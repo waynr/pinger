@@ -665,6 +665,7 @@ dependencies = [
  "rtnetlink",
  "serde",
  "socket2",
+ "thiserror",
  "tokio",
 ]
 

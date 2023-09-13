@@ -13,7 +13,7 @@ mod prober;
 mod probes;
 mod socket;
 
-use error::Result;
+use error::{Error, Result};
 use ethernet::EthernetConf;
 use prober::{Prober, TargetParams};
 use probes::icmp::IcmpProbe;
@@ -52,29 +52,26 @@ async fn main() -> Result<()> {
     let mut targets: Vec<Target> = Vec::new();
     for result in rdr.deserialize() {
         let t: Target = result?;
+        let addr = t.addr;
         if t.interval < 1 {
-            return Err(format!(
-                "error in target {}: interval must be between 1 and 1000 (ms)",
-                t.addr
-            )
-            .into());
+            return Err(Error::GenericStringError(format!(
+                "error in target {addr}: interval must be between 1 and 1000 (ms)",
+            )));
         }
         if t.interval > 1000 {
-            return Err(format!(
-                "error in target {}: interval must be between 1 and 1000 (ms)",
-                t.addr
-            )
-            .into());
+            return Err(Error::GenericStringError(format!(
+                "error in target {addr}: interval must be between 1 and 1000 (ms)",
+            )));
         }
         if t.count < 1 {
-            return Err(
-                format!("error in target {}: count must be between 1 and 10", t.addr).into(),
-            );
+            return Err(Error::GenericStringError(format!(
+                "error in target {addr}: count must be between 1 and 10",
+            )));
         }
         if t.count > 10 {
-            return Err(
-                format!("error in target {}: count must be between 1 and 10", t.addr).into(),
-            );
+            return Err(Error::GenericStringError(format!(
+                "error in target {addr}: count must be between 1 and 10",
+            )));
         }
         targets.push(t);
     }

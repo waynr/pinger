@@ -8,7 +8,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ethernet::EthernetConf;
 use crate::socket::AsyncSocket;
 
@@ -110,7 +110,9 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
         let output = match timeout(self.timeout.clone(), wait_for_reply_fut).await {
             Err(_elapsed) => {
                 println!("{},{},TIMEDOUT", tparams.addr, tparams.seq);
-                return Err(format!("timed out waiting for {} probe reply", tparams).into());
+                return Err(Error::GenericStringError(format!(
+                    "timed out waiting for {tparams} probe reply",
+                )));
             }
             Ok(o) => {
                 let elapsed = start.elapsed();
