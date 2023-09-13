@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
     let icmp_timeout = Duration::from_millis(cli.icmp_timeout);
 
     let probes = IcmpProbe::many(cli.concurrent_probes, &ethernet_conf)?;
-    let (mut prober, target_sender, mut output_receiver) = Prober::new()?;
+    let (prober, target_sender, mut output_receiver) = Prober::new()?;
 
     let probe_tasks_fut =
         tokio::spawn(async move { prober.run_probes(probes, ethernet_conf, icmp_timeout).await });

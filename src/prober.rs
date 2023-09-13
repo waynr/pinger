@@ -34,7 +34,9 @@ pub enum ProbeReport<P: Probe> {
 impl<P: Probe> std::fmt::Display for ProbeReport<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::ReceivedOutput(output, duration) => write!(f, "{output},{}", duration.as_micros()),
+            Self::ReceivedOutput(output, duration) => {
+                write!(f, "{output},{}", duration.as_micros())
+            }
             Self::TimedOut(targetparams) => write!(f, "{targetparams},DURATION"),
         }
     }
@@ -220,7 +222,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
     }
 
     pub async fn run_probes(
-        &mut self,
+        self,
         mut probes: Vec<P>,
         ethernet_conf: EthernetConf,
         timeout: Duration,
