@@ -15,6 +15,7 @@ use error::{Error, Result};
 use ethernet::EthernetConf;
 use prober::{Prober, TargetParams};
 use probes::icmp::IcmpProbe;
+use tokio::task::JoinSet;
 
 #[derive(Parser, Debug)]
 #[command(author, version)]
@@ -95,17 +96,26 @@ async fn main() -> Result<()> {
         }
     });
 
+    let mut set = JoinSet::new();
+
     for target in targets.into_iter() {
-        let mut interval = tokio::time::interval(Duration::from_millis(target.interval));
-        for i in 0..target.count {
-            interval.tick().await;
-            let tparams = TargetParams {
-                addr: target.addr,
-                seq: i,
-            };
-            target_sender.send(tparams).await?;
-        }
+        let sender = target_sender.clone();
+        set.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(target.interval));
+            for i in 0..target.count {
+                interval.tick().await;
+                let tparams = TargetParams {
+                    addr: target.addr,
+                    seq: i,
+                };
+                if let Err(e) = sender.send(tparams).await {
+                    log::error!("error sending target to ProbeTasks: {e}");
+                }
+            }
+        });
     }
+
+    while set.join_next().await.is_some() {}
 
     log::debug!("closing target sender");
     target_sender.close();
@@ -113,7 +123,7 @@ async fn main() -> Result<()> {
     log::debug!("awaiting probe tasks finish");
     probe_tasks_fut.await??;
 
-    log::debug!("awaiting probe tasks finish");
+    log::debug!("awaiting output handling task finish");
     output_handling_fut.await?;
 
     Ok(())
