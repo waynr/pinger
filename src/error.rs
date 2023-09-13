@@ -6,21 +6,21 @@ pub enum Error {
     #[error("{0}")]
     GenericStringError(String),
 
-    #[error("")]
+    #[error("{0:?}")]
     StdIoError(#[from] std::io::Error),
 
-    #[error("")]
+    #[error("{0:?}")]
     CsvError(#[from] csv::Error),
 
-    #[error("")]
+    #[error("{0:?}")]
     RtnetlinkError(#[from] rtnetlink::Error),
 
-    #[error("")]
+    #[error("{0:?}")]
     AsyncChannelRecvError(#[from] async_channel::RecvError),
 
-    #[error("")]
+    #[error("{0:?}")]
     TokioJoinError(#[from] tokio::task::JoinError),
 
-    #[error("")]
+    #[error("{0:?}")]
     AsyncChannelTargetParamsSendError(#[from] async_channel::SendError<super::prober::TargetParams>),
 }
