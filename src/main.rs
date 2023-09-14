@@ -28,7 +28,7 @@ struct Cli {
     #[arg(short, long)]
     interface: Option<String>,
 
-    #[arg(default_value_t = 5, short, long)]
+    #[arg(default_value_t = 1000, short, long)]
     concurrent_probes: usize,
 }
 
