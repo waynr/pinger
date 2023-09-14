@@ -37,7 +37,7 @@ impl<P: Probe> std::fmt::Display for ProbeReport<P> {
             Self::ReceivedOutput(output, duration) => {
                 write!(f, "{output},{}", duration.as_micros())
             }
-            Self::TimedOut(targetparams) => write!(f, "{targetparams},DURATION"),
+            Self::TimedOut(targetparams) => write!(f, "{targetparams},TIMEDOUT"),
         }
     }
 }
