@@ -45,18 +45,18 @@ impl IcmpProbe {
         let mut buf = [0u8; ICMP_REQUEST_PACKET_SIZE];
         {
             let mut ethernet_packet = MutableEthernetPacket::new(&mut buf).expect("meow");
-            log::debug!("ethernet_packet len: {}", ethernet_packet.packet().len());
+            log::trace!("ethernet_packet len: {}", ethernet_packet.packet().len());
             ethernet_packet.set_source(ethernet_conf.ethernet_info.source);
             ethernet_packet.set_destination(ethernet_conf.ethernet_info.destination);
             ethernet_packet.set_ethertype(ethernet_conf.ethernet_info.ethertype);
 
-            log::debug!(
+            log::trace!(
                 "ethernet_packet payload len: {}",
                 ethernet_packet.payload().len()
             );
             let mut ipv4_packet =
                 MutableIpv4Packet::new(ethernet_packet.payload_mut()).expect("meow");
-            log::debug!("ipv4_packetlen: {}", ipv4_packet.packet().len());
+            log::trace!("ipv4_packetlen: {}", ipv4_packet.packet().len());
             ipv4_packet.set_version(4);
             ipv4_packet.set_source(ethernet_conf.interface.address);
             ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Icmp);
@@ -73,13 +73,13 @@ impl IcmpProbe {
             );
             ipv4_packet.set_checksum(checksum);
 
-            log::debug!("ipv4 len: {}", MutableIpv4Packet::minimum_packet_size());
-            log::debug!(
+            log::trace!("ipv4 len: {}", MutableIpv4Packet::minimum_packet_size());
+            log::trace!(
                 "icmp min len: {}",
                 MutableEchoRequestPacket::minimum_packet_size()
             );
-            log::debug!("ipv4_packet total len: {}", ipv4_packet.get_total_length());
-            log::debug!("ipv4_packet payload len: {}", ipv4_packet.payload().len());
+            log::trace!("ipv4_packet total len: {}", ipv4_packet.get_total_length());
+            log::trace!("ipv4_packet payload len: {}", ipv4_packet.payload().len());
             let mut icmp_packet = MutableEchoRequestPacket::new(ipv4_packet.payload_mut())
                 .expect("the buf size should be exactly the minimum icmp packet size");
             icmp_packet.set_icmp_type(IcmpTypes::EchoRequest);
