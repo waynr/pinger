@@ -19,8 +19,14 @@ pub enum Error {
     AsyncChannelRecvError(#[from] async_channel::RecvError),
 
     #[error("{0:?}")]
+    AsyncChannelTryRecvError(#[from] async_channel::TryRecvError),
+
+    #[error("{0:?}")]
     TokioJoinError(#[from] tokio::task::JoinError),
 
     #[error("{0:?}")]
     AsyncChannelTargetParamsSendError(#[from] async_channel::SendError<super::prober::TargetParams>),
+
+    #[error("{0:?}")]
+    StdMpscTryRecvError(#[from] std::sync::mpsc::TryRecvError),
 }

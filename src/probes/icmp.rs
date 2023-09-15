@@ -149,7 +149,34 @@ impl Probe for IcmpProbe {
         Ok(())
     }
 
-    fn validate_response(&self, buf: &[u8], tparams: &TargetParams) -> Option<Self::Output> {
+    fn filter_responses(buf: &[u8]) -> bool {
+        // check that it's an ICMP packet
+        let ipv4_packet = Ipv4Packet::new(&buf)
+            .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
+        let protocol = ipv4_packet.get_next_level_protocol();
+        match protocol {
+            IpNextHeaderProtocols::Icmp => (),
+            _ => {
+                log::trace!("unexpected ip next level protocol number: {}", protocol);
+                return false;
+            }
+        }
+        // check that it's the right ICMP packet type
+        {
+            let icmp_packet = IcmpPacket::new(ipv4_packet.payload())
+                .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
+            match (icmp_packet.get_icmp_type(), icmp_packet.get_icmp_code()) {
+                (IcmpTypes::EchoReply, IcmpCode(0)) => (),
+                (t, c) => {
+                    log::trace!("unexpected icmp (type, code): ({:?}, {:?})", t, c);
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    fn validate_response(buf: &[u8], tparams: &TargetParams) -> Option<Self::Output> {
         if is_expected_packet(buf, &tparams.addr, tparams.seq) {
             Some(IcmpOutput {
                 addr: tparams.addr.clone(),
