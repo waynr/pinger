@@ -125,7 +125,10 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
         let probe_waiter_fut = {
             let (sender, receiver) = async_channel::bounded(1);
             // create a probe response waiter task
-            let probe_waiter_fut = async move { receiver.recv().await };
+            let probe_waiter_fut = tokio::spawn(async move {
+                log::debug!("waiting for response to probe");
+                receiver.recv().await
+            });
             if let Err(e) = self
                 .listener_register_sender
                 .send((tparams.clone(), sender))
@@ -145,20 +148,33 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
         let tparams = tparams.clone();
         let _fut = tokio::spawn(async move {
             let probe_report = match timeout(probe_timeout, probe_waiter_fut).await {
+                // Elapsed timeout error
                 Err(_elapsed) => {
                     log::debug!("timed out waiting for {tparams} probe reply");
                     ProbeReport::TimedOut(tparams.clone())
                 }
-                Ok(recv_err) => match recv_err {
-                    Ok(o) => {
-                        let elapsed = start.elapsed();
-                        ProbeReport::ReceivedOutput(o, elapsed)
+                // JoinError for probe waiter task
+                Ok(Err(e)) => {
+                    if e.is_panic() {
+                        log::debug!("probe waiter task panicked");
+                    } else if e.is_cancelled() {
+                        log::debug!("probe waiter task cancelled");
+                    } else {
+                        log::debug!("probe waiter task failed for unknown reason");
                     }
-                    Err(e) => {
-                        log::debug!("probe waiter failed to receive output: {e}");
-                        return;
-                    }
-                },
+                    // not clear if returning a result here would be helpful
+                    return;
+                }
+                // RecvError returned inside probe waiter task
+                Ok(Ok(Err(e))) => {
+                    log::debug!("probe waiter failed to receive output: {e}");
+                    return;
+                }
+                // whew!
+                Ok(Ok(Ok(o))) => {
+                    let elapsed = start.elapsed();
+                    ProbeReport::ReceivedOutput(o, elapsed)
+                }
             };
             match output_sender.send(probe_report) {
                 Ok(_) => (),
