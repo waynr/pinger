@@ -75,23 +75,6 @@ pub trait Probe {
 }
 
 /// ProbeTask holds general probe configuration and the sockets used to send request packets.
-///
-/// # Notes on Socket choice:
-///
-/// The reason I choose Domain::PACKET is that I have been reading the `zmap` paper recently[1] and
-/// learned one of the tricks they use to achieve such high packet throughput is to use AF_PACKET
-/// and manually construct Ethernet packets. This has two primary benefits:
-///
-/// First, it bypasses TCP/IP/whatever handling at the kernel level. This reduces kernel-specific
-/// cpu and memory overhead in high throughput applications.
-///
-/// Second, in network mapping (or ICMP echo as is the case here) there are often very few
-/// differences between the different request packets, which means one can optimize the
-/// program to reduce memory allocations by pre-allocating request packet buffers rather
-/// constructing them for every request. Request packet buffers are only needed for the duration of
-/// each send call, after which they can re-used for subsequent requests.
-///
-/// [1] https://zmap.io/paper.pdf
 #[derive(Debug)]
 struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
     probe: P,
@@ -370,6 +353,22 @@ fn create_receiver() -> Result<AsyncSocket> {
     Ok(AsyncSocket::new(socket)?)
 }
 
+/// # Notes on Socket choice:
+///
+/// The reason I choose Domain::PACKET is that I have been reading the `zmap` paper recently[1] and
+/// learned one of the tricks they use to achieve such high packet throughput is to use AF_PACKET
+/// and manually construct Ethernet packets. This has two primary benefits:
+///
+/// First, it bypasses TCP/IP/whatever handling at the kernel level. This reduces kernel-specific
+/// cpu and memory overhead in high throughput applications.
+///
+/// Second, in network mapping (or ICMP echo as is the case here) there are often very few
+/// differences between the different request packets, which means one can optimize the
+/// program to reduce memory allocations by pre-allocating request packet buffers rather
+/// constructing them for every request. Request packet buffers are only needed for the duration of
+/// each send call, after which they can re-used for subsequent requests.
+///
+/// [1] https://zmap.io/paper.pdf
 fn create_sender(ethernet_conf: &EthernetConf) -> Result<AsyncSocket> {
     // choose Domain::PACKET here so that we can cache ICMP reply packets and circumvent
     // network-layer handling of packets in the kernel
