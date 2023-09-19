@@ -9,6 +9,7 @@ use serde::Serialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -231,7 +232,9 @@ impl<P: Probe> ProbeListener<P> {
         if let Some((tparams, output)) = P::validate_response(buf) {
             if let Some(sender) = self.get_probe_sender(&tparams).await {
                 if let Err(e) = sender.send(output).await {
-                    log::debug!("failed to send output for {tparams:?} to handler, channel closed: {e}");
+                    log::debug!(
+                        "failed to send output for {tparams:?} to handler, channel closed: {e}"
+                    );
                     return Err(Error::OutputHandlerChannelClosed);
                 }
             } else {
@@ -333,12 +336,20 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
             });
         }
 
+        let cancel = CancellationToken::new();
+        let cloned_cancel = cancel.clone();
         let listener_fut = tokio::spawn(async move {
-            probe_listener.listen_forever().await;
+            tokio::select! {
+                _ = cloned_cancel.cancelled() => {},
+                _ = probe_listener.listen_forever() => {},
+            }
         });
 
+        log::debug!("waiting for probe tasks to finish");
         while join_set.join_next().await.is_some() {}
+        cancel.cancel();
 
+        log::debug!("waiting for ProbeListener task to finish");
         listener_fut.await?;
 
         Ok(())
