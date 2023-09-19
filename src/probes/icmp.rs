@@ -149,66 +149,21 @@ impl Probe for IcmpProbe {
         Ok(())
     }
 
-    fn filter_responses(buf: &[u8]) -> bool {
+    /// Check that the given buffer is:
+    /// * the right kind of IP packet (ICMP)
+    /// * the right kind of ICMP packet (Echo Reply)
+    /// If so, return the detected target params and probe output.
+    fn validate_response(buf: &[u8]) -> Option<(TargetParams, <IcmpProbe as Probe>::Output)> {
         // check that it's an ICMP packet
         let ipv4_packet = Ipv4Packet::new(&buf)
             .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
-        let protocol = ipv4_packet.get_next_level_protocol();
-        match protocol {
-            IpNextHeaderProtocols::Icmp => (),
-            _ => {
-                log::trace!("unexpected ip next level protocol number: {}", protocol);
-                return false;
-            }
-        }
-        // check that it's the right ICMP packet type
-        {
-            let icmp_packet = IcmpPacket::new(ipv4_packet.payload())
-                .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
-            match (icmp_packet.get_icmp_type(), icmp_packet.get_icmp_code()) {
-                (IcmpTypes::EchoReply, IcmpCode(0)) => (),
-                (t, c) => {
-                    log::trace!("unexpected icmp (type, code): ({:?}, {:?})", t, c);
-                    return false;
-                }
-            }
-        }
-        false
-    }
-
-    fn validate_response(buf: &[u8], tparams: &TargetParams) -> Option<Self::Output> {
-        if is_expected_packet(buf, &tparams.addr, tparams.seq) {
-            Some(IcmpOutput {
-                addr: tparams.addr.clone(),
-                seq: tparams.seq,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-/// Check that the given buffer is:
-/// * from the expected source IP
-/// * the right kind of IP packet (ICMP)
-/// * the right kind of ICMP packet (Echo Reply)
-/// * the expected sequence number
-fn is_expected_packet(reply_buf: &[u8], addr: &Ipv4Addr, seq: u16) -> bool {
-    // check that it's an ICMP packet
-    let ipv4_header_len = {
-        let ipv4_packet = Ipv4Packet::new(&reply_buf)
-            .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
         let source = &ipv4_packet.get_source();
-        if source != addr {
-            log::trace!("unexpected ipv4 source address: {source}");
-            return false;
-        }
         let protocol = ipv4_packet.get_next_level_protocol();
         match protocol {
             IpNextHeaderProtocols::Icmp => (),
             _ => {
                 log::trace!("unexpected ip next level protocol number: {}", protocol);
-                return false;
+                return None;
             }
         }
         // check that it's the right ICMP packet type
@@ -219,20 +174,32 @@ fn is_expected_packet(reply_buf: &[u8], addr: &Ipv4Addr, seq: u16) -> bool {
                 (IcmpTypes::EchoReply, IcmpCode(0)) => (),
                 (t, c) => {
                     log::trace!("unexpected icmp (type, code): ({:?}, {:?})", t, c);
-                    return false;
+                    return None;
                 }
             }
         }
         log::trace!("ipv4 header len: {}", ipv4_packet.get_header_length());
         log::trace!("ipv4 total len: {}", ipv4_packet.get_total_length());
-        ipv4_packet.get_total_length() as usize - ipv4_packet.payload().len() as usize
-    };
+        let ipv4_header_len =
+            ipv4_packet.get_total_length() as usize - ipv4_packet.payload().len() as usize;
 
-    log::trace!("ipv4 header len: {}", ipv4_header_len);
-    let reply_buf = &reply_buf[ipv4_header_len..];
-    log::trace!("echo reply buf len: {}", reply_buf.len());
-    let reply_packet = EchoReplyPacket::new(reply_buf)
-        .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
+        log::trace!("ipv4 header len: {}", ipv4_header_len);
+        let echo_reply_buf = &buf[ipv4_header_len..];
+        log::trace!("echo reply buf len: {}", echo_reply_buf.len());
+        let reply_packet = EchoReplyPacket::new(echo_reply_buf)
+            .expect("packet length already verified to be at least ICMP_REPLY_PACKET_SIZE");
 
-    reply_packet.get_sequence_number() == seq
+        let seq = reply_packet.get_sequence_number();
+
+        Some((
+            TargetParams {
+                addr: source.clone(),
+                seq,
+            },
+            IcmpOutput {
+                addr: source.clone(),
+                seq,
+            },
+        ))
+    }
 }

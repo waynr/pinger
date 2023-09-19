@@ -29,4 +29,7 @@ pub enum Error {
 
     #[error("{0:?}")]
     StdMpscTryRecvError(#[from] std::sync::mpsc::TryRecvError),
+
+    #[error("failed to send output on output handler channel")]
+    OutputHandlerChannelClosed,
 }

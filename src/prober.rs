@@ -1,20 +1,23 @@
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_channel::{Receiver as ACReceiver, Sender as ACSender, TryRecvError};
+use async_channel::{Receiver as ACReceiver, Sender as ACSender};
 use async_trait::async_trait;
 use serde::Serialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ethernet::EthernetConf;
 use crate::socket::AsyncSocket;
 
 /// Parametes describing a single `Probe` target.
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TargetParams {
     pub addr: Ipv4Addr,
     pub seq: u16,
@@ -48,19 +51,14 @@ impl<P: Probe> std::fmt::Display for ProbeReport<P> {
 pub trait Probe {
     // The output generated when the `Prober` successfully detects a response to the `Probe` for a
     // given `TargetParams`.
-    type Output: Send + Serialize + std::fmt::Display;
+    type Output: Send + Serialize + std::fmt::Debug + std::fmt::Display;
 
     /// Send request using the given `AsyncSocket` with the given `TargetParams`.
     async fn send(&mut self, socket: AsyncSocket, params: &TargetParams) -> Result<()>;
 
-    /// Generally filter packets of this Probe type without regard to whether this specific buffer
-    /// is associated with a given probe request.
-    fn filter_responses(buf: &[u8]) -> bool;
-
-    /// Validate whether or not a given response filtered by `Self::filter_responses` is associated
-    /// with the given target params; if so, return `Some(Self::Output)`.
-    // TODO: might be more efficient to use pcap or something else to filter packets
-    fn validate_response(buf: &[u8], params: &TargetParams) -> Option<Self::Output>;
+    /// Validate whether the given packet buffer matches this Probe type. If so, return the
+    /// detected TargetParams and Self::Output.
+    fn validate_response(buf: &[u8]) -> Option<(TargetParams, Self::Output)>;
 
     /// Return an AsyncSocket configured for this specific type of probe. Defaults to a RAW IPV4
     /// socket that receives ICMPV4 packets.
@@ -104,17 +102,7 @@ struct ProbeTask<P: Probe + Send + Sync + 'static + std::fmt::Debug> {
     output_sender: UnboundedSender<ProbeReport<P>>,
 
     sender: AsyncSocket,
-    // TODO: there is a risk if a `ProbeTask` is idle for too long that the socket's kernel-side
-    // receive buffer fills up with packets. this could lead to two problems: packet loss on the
-    // kernel side and unnecessary cpu usage on the user side when draining the receiver.
-    //
-    // in the long term it's probably better to have one single receiving socket "owned" by the
-    // `Prober` which distributes matching `Probe::Output` via oneshot channels to `ProbeTasks`
-    // that registry filter closures when they begin listening for their specific packet
-    //
-    // in the short term (while convering `IcmpProbe` to this generic `Prober` framework) it's
-    // probably fine to leave this as-is.
-    listener_register_sender: ACSender<(TargetParams, ACSender<P::Output>)>,
+    listener: ProbeListener<P>,
 
     timeout: Duration,
 }
@@ -129,15 +117,14 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
                 log::debug!("waiting for response to probe");
                 receiver.recv().await
             });
-            if let Err(e) = self
-                .listener_register_sender
-                .send((tparams.clone(), sender))
-                .await
-            {
-                log::debug!("registering with socket listener: {e}");
-            }
+            log::debug!("registering probe waiter with ProbeListener");
+            self.listener
+                .put_probe_sender(tparams.clone(), sender)
+                .await;
             probe_waiter_fut
         };
+
+        log::debug!("sending probe for {tparams}");
         self.probe.send(self.sender.clone(), tparams).await?;
 
         let start = Instant::now();
@@ -197,6 +184,7 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
                     break;
                 }
             };
+            log::debug!("received target {target}, attempting to send probe");
             match self.probe(&target).await {
                 Ok(probe_report) => probe_report,
                 Err(e) => {
@@ -210,65 +198,63 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> ProbeTask<P> {
     }
 }
 
+#[derive(Debug)]
 struct ProbeListener<P: Probe> {
-    waiting_probes: Vec<(TargetParams, ACSender<P::Output>)>,
-    probe_receiver: ACReceiver<(TargetParams, ACSender<P::Output>)>,
+    waiting_probes: Arc<Mutex<HashMap<TargetParams, ACSender<P::Output>>>>,
     socket: AsyncSocket,
+}
+
+impl<P: Probe> Clone for ProbeListener<P> {
+    fn clone(&self) -> Self {
+        Self {
+            waiting_probes: self.waiting_probes.clone(),
+            socket: self.socket.clone(),
+        }
+    }
 }
 
 impl<P: Probe> ProbeListener<P> {
     async fn listen_forever(mut self) {
         loop {
-            if let Err(e) = self.listen_once().await {
-                log::debug!("ProbeListener shutting down: {e}");
-                break;
+            let mut buf: Vec<u8> = Vec::with_capacity(4096);
+            if let Err(e) = self.recv(&mut buf).await {
+                log::debug!("ProbeListener receive failed: {e}");
+            }
+            if let Err(e) = self.handle_packet(&buf).await {
+                log::debug!("ProbeListener failed to handle packet: {e}");
             }
         }
     }
 
-    async fn listen_once(&mut self) -> Result<()> {
-        let mut buf: Vec<u8> = Vec::with_capacity(4096);
-        self.recv(&mut buf).await;
-        self.drain_channel()?;
-
-        if let Some(idx) = self.match_probe_receivers(&buf).await {
-            // need to drop the probe receiver if we found a match
-            let _probe_receiver = self.waiting_probes.swap_remove(idx);
+    async fn handle_packet(&mut self, buf: &[u8]) -> Result<()> {
+        log::debug!("received packet, checking for match with waiting probe");
+        if let Some((tparams, output)) = P::validate_response(buf) {
+            if let Some(sender) = self.get_probe_sender(&tparams).await {
+                if let Err(e) = sender.send(output).await {
+                    log::debug!("failed to send output for {tparams:?} to handler, channel closed: {e}");
+                    return Err(Error::OutputHandlerChannelClosed);
+                }
+            } else {
+                log::debug!("unable to match a detected packet to a probe waiter");
+            }
         }
 
         Ok(())
     }
 
-    fn drain_channel(&mut self) -> Result<()> {
-        loop {
-            match self.probe_receiver.try_recv() {
-                Ok(p) => {
-                    self.waiting_probes.push(p);
-                    continue;
-                }
-                Err(TryRecvError::Empty) => return Ok(()),
-                Err(e) => return Err(e.into()),
-            }
+    async fn put_probe_sender(&self, tparams: TargetParams, sender: ACSender<P::Output>) {
+        let mut g = self.waiting_probes.lock().await;
+        if let Some(_s) = g.insert(tparams.clone(), sender) {
+            log::error!("{tparams:?} already present in waiting probes");
         }
     }
 
-    async fn match_probe_receivers(&mut self, buf: &[u8]) -> Option<usize> {
-        if !P::filter_responses(buf) {
-            return None;
-        }
-
-        for (idx, probe) in self.waiting_probes.iter().enumerate() {
-            if let Some(output) = P::validate_response(buf, &probe.0) {
-                if let Err(e) = probe.1.send(output).await {
-                    log::error!("failed to send result to probe receiver: {e}");
-                }
-                return Some(idx);
-            }
-        }
-        None
+    async fn get_probe_sender(&self, tparams: &TargetParams) -> Option<ACSender<P::Output>> {
+        let mut g = self.waiting_probes.lock().await;
+        g.remove(tparams)
     }
 
-    async fn recv(&mut self, buf: &mut Vec<u8>) {
+    async fn recv(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
         let mut uninit = buf.spare_capacity_mut();
         match self.socket.recv(&mut uninit).await {
             Err(e) => {
@@ -281,6 +267,7 @@ impl<P: Probe> ProbeListener<P> {
                 unsafe {
                     buf.set_len(len);
                 }
+                Ok(len)
             }
         }
     }
@@ -322,22 +309,16 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
         let sender_socket = P::create_sender(&ethernet_conf)?;
         let mut join_set = JoinSet::new();
 
-        let (sender, receiver) = async_channel::unbounded();
         let probe_listener = ProbeListener::<P> {
-            waiting_probes: Vec::new(),
-            probe_receiver: receiver,
+            waiting_probes: Arc::new(Mutex::new(HashMap::new())),
             socket: P::create_receiver(&ethernet_conf)?,
         };
-
-        let listener_fut = tokio::spawn(async move {
-            probe_listener.listen_forever().await;
-        });
 
         for probe in probes.drain(0..) {
             let mut probe_task = ProbeTask {
                 probe,
                 sender: sender_socket.clone(),
-                listener_register_sender: sender.clone(),
+                listener: probe_listener.clone(),
                 timeout: timeout.clone(),
                 output_sender: self.output_sender.clone(),
                 target_receiver: self.target_receiver.clone(),
@@ -351,6 +332,10 @@ impl<P: Probe + Send + Sync + 'static + std::fmt::Debug> Prober<P> {
                 }
             });
         }
+
+        let listener_fut = tokio::spawn(async move {
+            probe_listener.listen_forever().await;
+        });
 
         while join_set.join_next().await.is_some() {}
 
